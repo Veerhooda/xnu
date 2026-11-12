@@ -134,7 +134,9 @@ enum { kOP2FenceEvent = 0, kOP2FenceMemWrite = 1, kOP2FenceRptr = 2 };
 /* Ringbuffer Configuration */
 #define OP2_GPU_RB_SIZE                 (32 * 1024)     /* 32 KB */
 #define OP2_GPU_RB_DWORDS               (OP2_GPU_RB_SIZE / 4)
-#define OP2_GPU_MAX_BUFFERS             256
+/* G5b: 256 ran out in backboardd (~95 CA pipelines = ~190 shader buffers, plus CA's own); the table is
+ * allocated per client (56 bytes an entry) */
+#define OP2_GPU_MAX_BUFFERS             2048
 
 /* DRM MSM Constants (Linux msm_drm.h ABI compatibility) */
 enum {
@@ -362,6 +364,8 @@ struct op2_gpu_client_buffer {
 	bool                      in_use;
 	bool                      owned;       /* allocated by gemNew (not an IOSurface's memory) */
 	uint64_t                  alloc_size;  /* size plus the guard band after it */
+	uint64_t                  pool_off, pool_len;   /* G5b: carved from the boot-time pool (pool_len 0: not) */
+	bool                      user_mapped;  /* G5c: mapped into the client (clientMemoryForType): may hold dirty lines */
 };
 
 class OP2GPUUserClient : public IOUserClient {
@@ -371,7 +375,7 @@ private:
 	task_t                   fTask;
 	OP2GPU                  *fOwner;
 	IOLock                  *fLock;
-	op2_gpu_client_buffer    fBuffers[OP2_GPU_MAX_BUFFERS];
+	op2_gpu_client_buffer   *fBuffers;   /* OP2_GPU_MAX_BUFFERS entries, IOMalloc'd in initWithTask */
 	uint32_t                 fBufferCount;
 	uint32_t                 fFaultsSeen;   /* fOwner->fFaultCount already described against our buffers */
 

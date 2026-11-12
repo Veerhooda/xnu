@@ -41,6 +41,8 @@ public:
 	IOOptionBits              mapCache;     /* cache mode for user mappings */
 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+	uint64_t                  poolOff, poolLen;   /* G5c: pixels from OP2GPU's boot-time pool (poolLen 0: not) */
+	OSDictionary             *values;       /* IOSurfaceSetValue(s): sel 9 stores, sel 10 copies (NULL: none yet) */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -72,6 +74,8 @@ OP2Surface *op2_surface_create_physical(uint64_t phys, uint32_t width,
 
 uint64_t op2_carveout_alloc_slot(uint32_t size);
 void op2_carveout_free_slot(uint64_t phys);
+extern "C" bool op2_gpu_pool_take(uint64_t bytes, IOMemoryDescriptor **desc, void **kaddr, uint64_t *off, uint64_t *len);
+extern "C" void op2_gpu_pool_give(uint64_t off, uint64_t len);
 
 /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
 mach_port_name_t op2_surface_port_in_task(OP2Surface *surface, task_t task);

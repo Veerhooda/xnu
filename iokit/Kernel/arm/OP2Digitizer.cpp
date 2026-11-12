@@ -513,6 +513,64 @@ static int op2_autotap_parsed = 0;
 static uint32_t op2_autoinput_mode = 1; /* boot-arg op2_autoinput */
 static uint32_t op2_autotap_count = 0;
 
+/*
+ * op2_autoinput=3: the iPhone X gesture test (rounds fable-33+, MobileGestalt HomeButtonType 2). Touch only -- never
+ * the Home key, which a phone without one should not see. 120 s after the first tick (SpringBoard up), then a
+ * ~70 s cycle forever: unlock swipe, Home swipe, Control Center from the top-right, dismiss, app-switcher
+ * swipe-and-hold, Home. Each gesture is logged as "OP2 Digitizer: G3 ..." so the backboardd frame captures
+ * (every 40 s) can be read against it.
+ */
+struct op2_g3_gesture {
+	const char *name;
+	uint16_t x0, y0, x1, y1;   /* fp16 screen fractions */
+	uint8_t samples;           /* moves, 16 ms apart */
+	uint16_t hold_ms;          /* finger stays down at the end */
+	uint32_t wait_ms;          /* after the lift */
+};
+static const struct op2_g3_gesture op2_g3[] = {
+	/* round fable-34: the 14-move 0.22 s unlock swipe dragged the cover sheet half up and it fell back every time;
+	 * 40 moves over 0.65 s to 12% of the height, like a deliberate thumb */
+	{ "unlock: slow swipe up from the bottom edge",   0x8000, 0xfff0, 0x8000, 0x2000, 40, 0,   6000 },
+	{ "unlock: fast swipe up from the bottom edge",   0x8000, 0xfff0, 0x8000, 0x4000, 14, 0,   6000 },
+	{ "control center: swipe down from top-right",    0xe800, 0x0010, 0xd800, 0x8000, 14, 0,   6000 },
+	{ "dismiss: swipe up from the bottom edge",       0x8000, 0xfff0, 0x8000, 0x2000, 40, 0,   6000 },
+	{ "app switcher: swipe up and hold",              0x8000, 0xfff0, 0x8000, 0xa800, 30, 900, 6000 },
+	{ "home: slow swipe up from the bottom edge",     0x8000, 0xfff0, 0x8000, 0x2000, 40, 0,  40000 },
+};
+static uint32_t op2_g3_index, op2_g3_sample, op2_g3_cycle;
+
+static void
+op2_g3_tick(OP2Digitizer *me, IOTimerEventSource *sender)
+{
+	static bool started;
+	if (!started) {
+		started = true;
+		IOLog("OP2 Digitizer: G3 gesture test armed: first gesture in 120 s\n");
+		sender->setTimeoutMS(120000);
+		return;
+	}
+	const struct op2_g3_gesture *g = &op2_g3[op2_g3_index];
+	uint32_t n = g->samples;
+	if (op2_g3_sample == 0)
+		IOLog("OP2 Digitizer: G3 cycle %u gesture %u: %s\n", op2_g3_cycle, op2_g3_index, g->name);
+	if (op2_g3_sample <= n) {
+		/* down at the start, then n moves to the end */
+		uint32_t x = g->x0 + (int32_t)(g->x1 - g->x0) * (int32_t)op2_g3_sample / (int32_t)n;
+		uint32_t y = g->y0 + (int32_t)(g->y1 - g->y0) * (int32_t)op2_g3_sample / (int32_t)n;
+		me->postDigitizerEvent(1, x, y, 0, true);
+		op2_g3_sample++;
+		sender->setTimeoutMS(op2_g3_sample > n && g->hold_ms ? g->hold_ms : 16);
+		return;
+	}
+	me->postDigitizerEvent(0, g->x1, g->y1, 0, true);
+	op2_g3_sample = 0;
+	if (++op2_g3_index == sizeof op2_g3 / sizeof op2_g3[0]) {
+		op2_g3_index = 0;
+		op2_g3_cycle++;
+	}
+	sender->setTimeoutMS(g->wait_ms);
+}
+
 void
 OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 {
@@ -523,7 +581,7 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		op2_autotap_parsed = 1;
 		PE_parse_boot_argn("op2_tapms", &op2_autotap_ms, sizeof(op2_autotap_ms));
 		PE_parse_boot_argn("op2_autoinput", &op2_autoinput_mode, sizeof(op2_autoinput_mode));
-		IOLog("OP2 Digitizer: synthetic input mode %u (0=off, 1=wake-only, 2=full test script)\n",
+		IOLog("OP2 Digitizer: synthetic input mode %u (0=off, 1=wake-only, 2=full test script, 3=X gestures)\n",
 		    op2_autoinput_mode);
 	}
 
@@ -534,6 +592,10 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 	 * wake-only: pulse Home until the Lock Screen is lit, then stop forever.
 	 */
 	if (op2_autoinput_mode == 0) {
+		return;
+	}
+	if (op2_autoinput_mode == 3) {
+		op2_g3_tick(me, sender);
 		return;
 	}
 	if (op2_autoinput_mode == 1 && me->fTapStep != 0 && me->fTapStep != 18) {

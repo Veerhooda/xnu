@@ -608,6 +608,210 @@ static int sdhc_read_multi_block(uint32_t lba, uint8_t *buf, uint32_t nblk)
 	return 0;
 }
 
+/*
+ * ADMA2 reads (2026-11-12, docs/FOUNDATION-BENCH.md): PIO pulls SDHCI_BUFFER one 32-bit device read at a time and
+ * topped out at 16.7 MB/s sequential, ~640 us per 16 KB page, holding a CPU throughout -- the root of the lag on the
+ * CPU and GPU builds alike. Here the controller writes into a physically contiguous bounce buffer through a 32-bit
+ * ADMA2 descriptor table (two 64 KB descriptors: up to 256 sectors per CMD18), the CPU waits for DATA_END, invalidates
+ * the buffer and copies it out (a cached memcpy, GB/s). Writes stay PIO. A boot self-test compares DMA with PIO reads
+ * byte for byte (op2_emmc_dma_ok); boot-arg op2_emmc_dma=0 turns it off; any DMA failure falls back to PIO.
+ */
+#define SDHCI_DMA_ADDRESS       0x00
+#define SDHCI_TRNS_DMA          (1u << 0)
+#define SDHCI_CAPABILITIES      0x40
+#define  SDHCI_CAN_DO_ADMA2     (1u << 19)
+#define SDHCI_ADMA_ERROR        0x54
+#define SDHCI_ADMA_ADDRESS      0x58
+#define  SDHCI_CTRL_DMA_MASK    (3u << 3)
+#define  SDHCI_CTRL_ADMA32      (2u << 3)
+#define SDHCI_INT_ADMA_ERROR    (1u << 25)
+#define OP2_DMA_MAX_SECTORS     256u
+#define OP2_DMA_DATA_BYTES      (OP2_DMA_MAX_SECTORS * EMMC_SECTOR_SIZE)
+#define OP2_DMA_DESC_BYTES      4096u
+
+extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, void *physicalAddress);
+extern uint64_t kvtophys(vm_offset_t va);   /* pmap_paddr_t, not visible to BSD */
+
+static uint8_t *op2_dma_desc, *op2_dma_data;
+static uint32_t op2_dma_desc_pa, op2_dma_data_pa;
+static int op2_emmc_dma_ok = -1;            /* -1 untested, 0 off, 1 on */
+static uint64_t op2_emmc_dma_cmds = 0, op2_emmc_dma_fails = 0;
+
+static inline void
+op2_dma_civac(const void *va, size_t size)
+{
+	uintptr_t a = (uintptr_t)va & ~(uintptr_t)63, end = ((uintptr_t)va + size + 63) & ~(uintptr_t)63;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (; a < end; a += 64)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* the bounce buffer and descriptor table, once; false (DMA stays off) if not possible */
+static bool
+op2_dma_setup(void)
+{
+	if (op2_dma_data)
+		return true;
+	if (!(sdhc_rd32(SDHCI_CAPABILITIES) & SDHCI_CAN_DO_ADMA2)) {
+		printf("OP2 eMMC: controller has no ADMA2 (caps 0x%08x)\n", sdhc_rd32(SDHCI_CAPABILITIES));
+		return false;
+	}
+	uint8_t *mem = (uint8_t *)IOMallocContiguous(OP2_DMA_DESC_BYTES + OP2_DMA_DATA_BYTES, 4096, NULL);
+	if (!mem) {
+		printf("OP2 eMMC: no contiguous memory for DMA\n");
+		return false;
+	}
+	uint64_t pa = kvtophys((vm_offset_t)mem);
+	uint64_t pa_end = kvtophys((vm_offset_t)mem + OP2_DMA_DESC_BYTES + OP2_DMA_DATA_BYTES - 1);
+	if (pa == 0 || pa_end >= (1ULL << 32) || pa_end - pa != OP2_DMA_DESC_BYTES + OP2_DMA_DATA_BYTES - 1) {
+		printf("OP2 eMMC: DMA buffer at 0x%llx..0x%llx is not 32-bit contiguous\n",
+		    (unsigned long long)pa, (unsigned long long)pa_end);
+		return false;
+	}
+	op2_dma_desc = mem;
+	op2_dma_data = mem + OP2_DMA_DESC_BYTES;
+	op2_dma_desc_pa = (uint32_t)pa;
+	op2_dma_data_pa = (uint32_t)(pa + OP2_DMA_DESC_BYTES);
+	/* the ADMA error must reach INT_STATUS (the bootloader enabled what PIO needs) */
+	sdhc_wr32(SDHCI_INT_ENABLE, sdhc_rd32(SDHCI_INT_ENABLE) | SDHCI_INT_ADMA_ERROR | SDHCI_INT_DATA_END);
+	printf("OP2 eMMC: ADMA2 bounce buffer %u KB at PA 0x%08x, descriptors at 0x%08x\n",
+	    OP2_DMA_DATA_BYTES >> 10, op2_dma_data_pa, op2_dma_desc_pa);
+	/* the bus as the bootloader left it: 42 MB/s with DMA (round fable-43) says high speed 52 MHz, not HS200 */
+	printf("OP2 eMMC: bus: clock ctl 0x%04x host ctl 0x%02x host ctl2 0x%04x caps 0x%08x/0x%08x\n",
+	    sdhc_rd16(SDHCI_CLOCK_CONTROL), sdhc_rd8(SDHCI_HOST_CONTROL), sdhc_rd16(SDHCI_HOST_CONTROL2),
+	    sdhc_rd32(SDHCI_CAPABILITIES), sdhc_rd32(SDHCI_CAPABILITIES + 4));
+	return true;
+}
+
+static void
+op2_dma_select(bool adma)
+{
+	uint8_t hc = sdhc_rd8(SDHCI_HOST_CONTROL);
+	hc = (uint8_t)((hc & ~SDHCI_CTRL_DMA_MASK) | (adma ? SDHCI_CTRL_ADMA32 : 0));
+	sdhc_wr8(SDHCI_HOST_CONTROL, hc);
+}
+
+/* CMD18 of nblk (2..256) sectors by ADMA2 into buf; the same error codes as sdhc_read_multi_block */
+static int
+sdhc_read_dma(uint32_t lba, uint8_t *buf, uint32_t nblk)
+{
+	uint64_t start = ml_get_timebase();
+	uint64_t ticks = 500000ULL * 192ULL / 10ULL;
+
+	if (op2_emmc_dat0_wait() != 0) {
+		op2_emmc_card_abort();
+		return -1;
+	}
+	while (sdhc_rd32(SDHCI_PRESENT_STATE) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) {
+		if (ml_get_timebase() - start >= ticks) {
+			sdhc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+			op2_emmc_card_abort();
+			return -1;
+		}
+		__asm__ volatile("isb");
+	}
+
+	/* descriptors: tran, valid; 64 KB each (length 0 = 65536), the last one END */
+	uint32_t bytes = nblk * EMMC_SECTOR_SIZE, ndesc = 0;
+	uint32_t *d = (uint32_t *)(void *)op2_dma_desc;
+	for (uint32_t off = 0; off < bytes; off += 65536) {
+		uint32_t len = MIN(65536u, bytes - off);
+		uint32_t attr = 0x21 | (off + len >= bytes ? 0x2 : 0);
+		d[ndesc * 2] = attr | ((len & 0xffff) << 16);
+		d[ndesc * 2 + 1] = op2_dma_data_pa + off;
+		ndesc++;
+	}
+	op2_dma_civac(op2_dma_desc, ndesc * 8);
+	op2_dma_civac(op2_dma_data, bytes);   /* nothing dirty may land on top of the DMA */
+
+	op2_dma_select(true);
+	sdhc_wr32(SDHCI_ADMA_ADDRESS, op2_dma_desc_pa);
+	sdhc_wr32(SDHCI_INT_STATUS, 0xFFFFFFFF);
+	sdhc_wr16(SDHCI_BLOCK_SIZE, 512 | (7u << 12));
+	sdhc_wr16(SDHCI_BLOCK_COUNT, (uint16_t)nblk);
+	sdhc_wr32(SDHCI_ARGUMENT, lba);
+	sdhc_wr16(SDHCI_TRANSFER_MODE, SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN |
+	    SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD12);
+	uint16_t cmd_flags = SDHCI_CMD_DATA_PRESENT | SDHCI_CMD_INDEX_CHECK | SDHCI_CMD_CRC_CHECK | SDHCI_CMD_RESP_SHORT;
+	sdhc_wr16(SDHCI_COMMAND, (18 << 8) | cmd_flags);
+
+	int rc = 0;
+	uint32_t is = 0;
+	start = ml_get_timebase();
+	ticks = 500000ULL * 192ULL / 10ULL;
+	while (ml_get_timebase() - start < ticks) {
+		is = sdhc_rd32(SDHCI_INT_STATUS);
+		if (is & (SDHCI_INT_DATA_END | SDHCI_INT_ERROR))
+			break;
+		__asm__ volatile("isb");
+	}
+	if ((is & SDHCI_INT_ERROR) || !(is & SDHCI_INT_DATA_END)) {
+		if (op2_emmc_dma_fails < 4)
+			printf("OP2 eMMC: DMA read lba %u n %u: int 0x%08x adma_err 0x%02x\n", lba, nblk, is,
+			    sdhc_rd8(SDHCI_ADMA_ERROR));
+		sdhc_wr32(SDHCI_INT_STATUS, is);
+		sdhc_wr8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+		op2_emmc_card_abort();
+		rc = (is & SDHCI_INT_DATA_END) ? -3 : -4;
+	}
+	sdhc_wr32(SDHCI_INT_STATUS, 0xFFFFFFFF);
+	op2_dma_select(false);   /* PIO paths (single block, writes) expect no DMA selected */
+	if (rc == 0) {
+		op2_dma_civac(op2_dma_data, bytes);   /* drop anything speculatively fetched during the transfer */
+		memcpy(buf, op2_dma_data, bytes);
+	}
+	return rc;
+}
+
+/* once: DMA must read what PIO reads, over two sizes, or it stays off this boot */
+static void
+op2_emmc_dma_selftest(void)
+{
+	int en = 1;
+	PE_parse_boot_argn("op2_emmc_dma", &en, sizeof(en));
+	op2_emmc_dma_ok = 0;
+	if (!en) {
+		printf("OP2 eMMC: DMA reads off (boot-arg)\n");
+		return;
+	}
+	if (!op2_dma_setup())
+		return;
+	static uint8_t st_dma[OP2_DMA_DATA_BYTES] __attribute__((aligned(64)));
+	static uint8_t st_pio[OP2_DMA_DATA_BYTES] __attribute__((aligned(64)));
+	const uint32_t sizes[2] = { 32, OP2_DMA_MAX_SECTORS };
+	const uint32_t at[2] = { 4096, 8192 };
+	for (int t = 0; t < 2; t++) {
+		uint32_t lba = (uint32_t)(op2_emmc.first_block + at[t]), n = sizes[t];
+		memset(st_dma, 0xa5, n * EMMC_SECTOR_SIZE);
+		int rc = sdhc_read_dma(lba, st_dma, n);
+		int pio = 0;
+		for (uint32_t k = 0; rc == 0 && pio == 0 && k < n; k += 128)
+			pio = sdhc_read_multi_block(lba + k, st_pio + k * EMMC_SECTOR_SIZE, MIN(128u, n - k));
+		bool same = rc == 0 && pio == 0 && memcmp(st_dma, st_pio, n * EMMC_SECTOR_SIZE) == 0;
+		if (!same) {
+			uint32_t at_byte = 0;
+			while (rc == 0 && pio == 0 && at_byte < n * EMMC_SECTOR_SIZE && st_dma[at_byte] == st_pio[at_byte])
+				at_byte++;
+			printf("OP2 eMMC: DMA self-test FAILED (%u sectors: dma rc %d, pio rc %d, first difference at byte %u)\n",
+			    n, rc, pio, at_byte);
+			return;
+		}
+	}
+	/* timing, for the record: 4 MB both ways */
+	uint64_t t0 = ml_get_timebase();
+	int bad = 0;
+	for (uint32_t k = 0; k < 8192 && !bad; k += OP2_DMA_MAX_SECTORS)
+		bad = sdhc_read_dma((uint32_t)(op2_emmc.first_block + 16384 + k), st_dma, OP2_DMA_MAX_SECTORS);
+	uint64_t t1 = ml_get_timebase();
+	for (uint32_t k = 0; k < 8192 && !bad; k += 128)
+		bad = sdhc_read_multi_block((uint32_t)(op2_emmc.first_block + 16384 + k), st_pio, 128);
+	uint64_t t2 = ml_get_timebase();
+	op2_emmc_dma_ok = 1;
+	printf("OP2 eMMC: DMA self-test PASSED; 4 MB: DMA %llu us, PIO %llu us\n",
+	    (unsigned long long)((t1 - t0) * 10 / 192), (unsigned long long)((t2 - t1) * 10 / 192));
+}
+
 static int sdhc_write_single_block(uint32_t lba, const uint8_t *buf)
 {
 	uint64_t start = ml_get_timebase();
@@ -837,6 +1041,13 @@ op2_emmc_dump_stats(void)
 	printf("OP2 eMMC MULTI: cmds=%llu fails=%llu enabled=%d\n",
 	    (unsigned long long)op2_emmc_multi_cmds, (unsigned long long)op2_emmc_multi_fails,
 	    op2_emmc_multi_ok);
+	printf("OP2 eMMC DMA: cmds=%llu fails=%llu enabled=%d\n", (unsigned long long)op2_emmc_dma_cmds,
+	    (unsigned long long)op2_emmc_dma_fails, op2_emmc_dma_ok);
+	if (op2_emmc.regs) {
+		printf("OP2 eMMC bus: clock ctl 0x%04x host ctl 0x%02x host ctl2 0x%04x caps 0x%08x/0x%08x\n",
+		    sdhc_rd16(SDHCI_CLOCK_CONTROL), sdhc_rd8(SDHCI_HOST_CONTROL), sdhc_rd16(SDHCI_HOST_CONTROL2),
+		    sdhc_rd32(SDHCI_CAPABILITIES), sdhc_rd32(SDHCI_CAPABILITIES + 4));
+	}
 	printf("OP2 eMMC STATS: reads=%llu rd_fail=%llu wr_fail=%llu map_fail=%llu oob=%llu retry_ok=%llu wr_retry_ok=%llu recoveries=%llu fails_recorded=%u%s\n",
 	    (unsigned long long)op2_emmc_read_blocks,
 	    (unsigned long long)op2_emmc_fail_rd,
@@ -977,6 +1188,28 @@ static void op2_emmc_strategy(buf_t bp)
 				printf("OP2 eMMC: multi-block self-test %s (rc=%d)\n", st_ok ? "PASSED" : "FAILED", st_rc);
 			}
 			printf("OP2 eMMC: multi-block reads %s\n", op2_emmc_multi_ok ? "enabled" : "disabled");
+		}
+		if ((buf_flags(bp) & B_READ) && op2_emmc_dma_ok < 0 && op2_emmc_multi_ok > 0) {
+			op2_emmc_dma_selftest();
+		}
+		if ((buf_flags(bp) & B_READ) && op2_emmc_dma_ok > 0 && chunk == EMMC_SECTOR_SIZE &&
+		    (count - done_bytes) >= 2 * EMMC_SECTOR_SIZE) {
+			uint32_t nblk = MIN((count - done_bytes) / EMMC_SECTOR_SIZE, OP2_DMA_MAX_SECTORS);
+			int drc = sdhc_read_dma((uint32_t)lba, (uint8_t *)vaddr + done_bytes, nblk);
+			if (drc == 0) {
+				op2_emmc_read_blocks += nblk;
+				op2_emmc_dma_cmds++;
+				done_bytes += (nblk - 1) * EMMC_SECTOR_SIZE; /* loop adds the last one */
+				buf_setresid(bp, count - (done_bytes + EMMC_SECTOR_SIZE));
+				continue;
+			}
+			op2_emmc_dma_fails++;
+			if (op2_emmc_dma_fails >= 8 && op2_emmc_dma_fails * 100 > op2_emmc_dma_cmds) {
+				op2_emmc_dma_ok = 0;
+				printf("OP2 eMMC: DMA reads DISABLED (%llu failures in %llu)\n",
+				    (unsigned long long)op2_emmc_dma_fails, (unsigned long long)op2_emmc_dma_cmds);
+			}
+			/* fall through: the PIO paths below */
 		}
 		if ((buf_flags(bp) & B_READ) && op2_emmc_multi_ok > 0 &&
 		    chunk == EMMC_SECTOR_SIZE &&

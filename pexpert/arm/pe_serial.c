@@ -873,8 +873,14 @@ static int op2_ramoops_rr0(void) { return 0; }
 static int op2_ramoops_rd0(void) { return 0; }
 #define OP2_RAMOOPS_CAPACITY 260000
 
+/* bsd/dev/op2_usb.c: the console also streams over the USB CDC-ACM gadget once it is up */
+void (*op2_usb_putc_hook)(int c) = NULL;
+
 static void op2_ramoops_td0(int c)
 {
+	if (op2_usb_putc_hook) {
+		op2_usb_putc_hook(c);
+	}
 	if (!g_ramoops_buf) return;
 	uint32_t start = g_ramoops_buf->start;
 	uint32_t sz = g_ramoops_buf->size;

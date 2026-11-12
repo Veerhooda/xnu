@@ -9,6 +9,7 @@
  * 5. Hardware command processing & PM4 Type 3 packet execution
  */
 
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include "OP2GPU.h"
 #include "OP2Surface.h"
 #include "op2_a430_fw.h"
@@ -1574,11 +1575,152 @@ OP2GPU::init(OSDictionary *dictionary)
 	return true;
 }
 
+/* G5b: the held list is shared by every client (backboardd and SpringBoard close buffers at the same time:
+ * round g5b-2 released one descriptor twice, and a user client's mappings set held the freed map). Each client's
+ * fLock does not cover it; this does. Taken inside fLock, never the other way round. */
+static IOLock *gHeldLock;
+
+/*
+ * G5b: a physically contiguous pool reserved at boot for large GPU buffers. Once iOS is up, 28 MB of contiguous
+ * memory is not to be had (round g5b-9: CA's 2592x2592 BGRA texture was refused, and what it held drew black);
+ * at boot it is. Made only with metal=2 or more (CoreAnimation on the GPU); buffers of OP2_GPU_POOL_MIN or more
+ * are carved from it (first fit, 64 KB granules), the rest, and anything the pool cannot fit, as before.
+ */
+#define OP2_GPU_POOL_BYTES   (192ULL << 20)
+#define OP2_GPU_POOL_BYTES3  (512ULL << 20)   /* metal=3: backboardd AND SpringBoard render big targets (fable-25), and
+                                                * every IOSurface comes from the pool too (fable-30) */
+static uint64_t gPoolBytes = OP2_GPU_POOL_BYTES;
+#define OP2_GPU_POOL_MIN     (2ULL << 20)
+#define OP2_GPU_POOL_GRANULE (64ULL << 10)
+#define OP2_GPU_POOL_EXTENTS 128
+static IOBufferMemoryDescriptor *gPool;
+static uint8_t *gPoolKaddr;
+static uint64_t gPoolPhys;
+static struct { uint64_t off, len; } gPoolFree[OP2_GPU_POOL_EXTENTS];   /* sorted by off, merged */
+static unsigned gPoolNFree;
+static IOLock *gPoolLock;
+
+static void
+op2_pool_init(uint32_t metal_level)
+{
+	gPoolBytes = metal_level >= 3 ? OP2_GPU_POOL_BYTES3 : OP2_GPU_POOL_BYTES;
+	gPoolLock = IOLockAlloc();
+	gPool = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+	    (vm_size_t)gPoolBytes, 0x00000000FFFFF000ULL);
+	if (!gPool || !gPoolLock) {
+		IOLog("OP2 GPU POOL: no %llu MB contiguous below 4 GB at boot: large buffers allocate as before\n",
+		      gPoolBytes >> 20);
+		OSSafeReleaseNULL(gPool);
+		return;
+	}
+	gPoolKaddr = (uint8_t *)gPool->getBytesNoCopy();
+	gPoolPhys = (uint64_t)gPool->getPhysicalAddress();
+	gPoolFree[0].off = 0;
+	gPoolFree[0].len = gPoolBytes;
+	gPoolNFree = 1;
+	IOLog("OP2 GPU POOL: %llu MB at phys 0x%llx for buffers of %llu MB or more\n", gPoolBytes >> 20,
+	      gPoolPhys, OP2_GPU_POOL_MIN >> 20);
+}
+
+static bool
+op2_pool_alloc(uint64_t len, uint64_t *off)
+{
+	bool ok = false;
+	IOLockLock(gPoolLock);
+	for (unsigned i = 0; i < gPoolNFree; i++) {
+		if (gPoolFree[i].len >= len) {
+			*off = gPoolFree[i].off;
+			gPoolFree[i].off += len;
+			gPoolFree[i].len -= len;
+			if (!gPoolFree[i].len) {
+				memmove(&gPoolFree[i], &gPoolFree[i + 1], (gPoolNFree - i - 1) * sizeof(gPoolFree[0]));
+				gPoolNFree--;
+			}
+			ok = true;
+			break;
+		}
+	}
+	IOLockUnlock(gPoolLock);
+	return ok;
+}
+
+static void
+op2_pool_free(uint64_t off, uint64_t len)
+{
+	IOLockLock(gPoolLock);
+	unsigned i = 0;
+	while (i < gPoolNFree && gPoolFree[i].off < off)
+		i++;
+	bool prev = i > 0 && gPoolFree[i - 1].off + gPoolFree[i - 1].len == off;
+	bool next = i < gPoolNFree && off + len == gPoolFree[i].off;
+	if (prev && next) {
+		gPoolFree[i - 1].len += len + gPoolFree[i].len;
+		memmove(&gPoolFree[i], &gPoolFree[i + 1], (gPoolNFree - i - 1) * sizeof(gPoolFree[0]));
+		gPoolNFree--;
+	} else if (prev) {
+		gPoolFree[i - 1].len += len;
+	} else if (next) {
+		gPoolFree[i].off = off;
+		gPoolFree[i].len += len;
+	} else if (gPoolNFree < OP2_GPU_POOL_EXTENTS) {
+		memmove(&gPoolFree[i + 1], &gPoolFree[i], (gPoolNFree - i) * sizeof(gPoolFree[0]));
+		gPoolFree[i].off = off;
+		gPoolFree[i].len = len;
+		gPoolNFree++;
+	} else {
+		IOLog("OP2 GPU POOL: free list full: %llu bytes at +0x%llx lost\n", len, off);
+	}
+	IOLockUnlock(gPoolLock);
+}
+
+/*
+ * IOSurfaces from the pool (OP2Surface, metal>=2). Round fable-30: SpringBoard made new 11 MB surfaces long after boot,
+ * contiguous memory had run out ("vm_page_find_contiguous ... found 0"), the surfaces were scattered, the GPU wrote them
+ * as if contiguous: SMMU faults, three GPU hangs, SpringBoard crashed. The pool was reserved at boot and stays
+ * contiguous. take: a sub-descriptor and kernel address of `bytes` (granule-rounded); give: the range back.
+ */
+extern "C" bool
+op2_gpu_pool_take(uint64_t bytes, IOMemoryDescriptor **desc, void **kaddr, uint64_t *off, uint64_t *len)
+{
+	if (!gPool || !gPoolLock)
+		return false;
+	uint64_t l = (bytes + OP2_GPU_POOL_GRANULE - 1) & ~(OP2_GPU_POOL_GRANULE - 1);
+	uint64_t o = 0;
+	if (!op2_pool_alloc(l, &o))
+		return false;
+	IOMemoryDescriptor *d = IOSubMemoryDescriptor::withSubRange(gPool, (IOByteCount)o, (IOByteCount)l,
+	                                                             kIODirectionInOut);
+	if (!d) {
+		op2_pool_free(o, l);
+		return false;
+	}
+	*desc = d;
+	*kaddr = gPoolKaddr + o;
+	*off = o;
+	*len = l;
+	return true;
+}
+
+extern "C" void
+op2_gpu_pool_give(uint64_t off, uint64_t len)
+{
+	if (gPoolLock && len)
+		op2_pool_free(off, len);
+}
+
 bool
 OP2GPU::start(IOService *provider)
 {
 	if (!IOService::start(provider))
 		return false;
+	if (!gHeldLock)
+		gHeldLock = IOLockAlloc();
+	{
+		uint32_t metal_level = 0;
+		if (!gPool && PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2)
+			op2_pool_init(metal_level);
+	}
 
 	uint32_t gpu_arg = 1;
 	PE_parse_boot_argn("gpu", &gpu_arg, sizeof(gpu_arg));
@@ -1655,8 +1797,12 @@ OP2GPU::start(IOService *provider)
 	}
 
 	/* Put the GPU behind real translation so a stray write faults instead of corrupting RAM
-	 * (G4c). Off by default during bring-up; gpu_xl=1 turns it on (short: the cmdline is full). */
-	uint32_t gpu_smmu_xlate = 0;
+	 * (G4c). Off by default during bring-up; gpu_xl=1 turns it on (short: the cmdline is full), and so does
+	 * metal=2 or more (G5: CoreAnimation drawing through the GPU), which has no room left for gpu_xl=1;
+	 * gpu_xl=0 still turns it off. */
+	uint32_t gpu_smmu_xlate = 0, metal_level = 0;
+	if (PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2)
+		gpu_smmu_xlate = 1;
 	PE_parse_boot_argn("gpu_xl", &gpu_smmu_xlate, sizeof(gpu_smmu_xlate));
 	if (gpu_smmu_xlate && gpu_smmusec) {
 		enableTranslation();
@@ -1942,7 +2088,11 @@ OP2GPUUserClient::releaseBuffer(struct op2_gpu_client_buffer *b, uint32_t handle
 		else if (b->phys_addr) fOwner->unmapRange(b->phys_addr, b->size);
 	}
 	if (b->desc) {
-		uint32_t held = 1;
+		/* G5b: off by default once CA draws on the GPU (metal=2+): the G4b stray write it hunted is fixed, and
+		 * 48 MB of held contiguous memory is what large textures then cannot get */
+		uint32_t held = 1, metal_level = 0;
+		if (PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2)
+			held = 0;
 		PE_parse_boot_argn("gpu_held", &held, sizeof(held));
 		if (b->owned) {
 			uint32_t n = 0;
@@ -1954,8 +2104,14 @@ OP2GPUUserClient::releaseBuffer(struct op2_gpu_client_buffer *b, uint32_t handle
 				      handle, b->phys_addr, b->size, n, first * 4, guard[first]);
 			}
 		}
-		if (b->owned && held) {
+		if (b->pool_len) {
+			/* from the pool: back to it (never held: the pool is what large buffers need) */
+			b->desc->release();
+			op2_pool_free(b->pool_off, b->pool_len);
+		} else if (b->owned && held && gHeldLock) {
+			IOLockLock(gHeldLock);
 			op2_held_add(b->desc, (uint32_t *)b->kernel_addr, b->phys_addr, b->alloc_size, handle);
+			IOLockUnlock(gHeldLock);
 		} else {
 			b->desc->release();
 		}
@@ -1965,6 +2121,9 @@ OP2GPUUserClient::releaseBuffer(struct op2_gpu_client_buffer *b, uint32_t handle
 	b->phys_addr = 0;
 	b->size = 0;
 	b->alloc_size = 0;
+	b->pool_off = 0;
+	b->pool_len = 0;
+	b->user_mapped = false;
 	b->fence = 0;
 	b->owned = false;
 	b->in_use = false;
@@ -1982,7 +2141,10 @@ OP2GPUUserClient::initWithTask(task_t owningTask, void *securityID,
 	fBufferCount = 0;
 	fFaultsSeen = 0;
 	fLock = IOLockAlloc();
-	bzero(fBuffers, sizeof(fBuffers));
+	fBuffers = (op2_gpu_client_buffer *)IOMalloc(OP2_GPU_MAX_BUFFERS * sizeof(op2_gpu_client_buffer));
+	if (!fLock || !fBuffers)
+		return false;
+	bzero(fBuffers, OP2_GPU_MAX_BUFFERS * sizeof(op2_gpu_client_buffer));
 	return true;
 }
 
@@ -1996,6 +2158,7 @@ OP2GPUUserClient::start(IOService *provider)
 	if (!fOwner) {
 		return false;
 	}
+	fFaultsSeen = fOwner->fFaultCount;   /* describe only faults from our own time, not the boot self-test's */
 	return true;
 }
 
@@ -2016,9 +2179,13 @@ OP2GPUUserClient::clientClose(void)
 		}
 	}
 	fBufferCount = 0;
-	op2_held_sweep("client exit");
-	IOLog("OP2 GPU HELD: client exit: %u buffers (%llu bytes) held, %u reports so far\n",
-	      gHeldCount, gHeldBytes, gReports);
+	if (gHeldLock) {
+		IOLockLock(gHeldLock);
+		op2_held_sweep("client exit");
+		IOLog("OP2 GPU HELD: client exit: %u buffers (%llu bytes) held, %u reports so far\n",
+		      gHeldCount, gHeldBytes, gReports);
+		IOLockUnlock(gHeldLock);
+	}
 	IOLockUnlock(fLock);
 
 	terminate();
@@ -2031,6 +2198,10 @@ OP2GPUUserClient::free(void)
 	if (fLock) {
 		IOLockFree(fLock);
 		fLock = NULL;
+	}
+	if (fBuffers) {
+		IOFree(fBuffers, OP2_GPU_MAX_BUFFERS * sizeof(op2_gpu_client_buffer));
+		fBuffers = NULL;
 	}
 	IOUserClient::free();
 }
@@ -2066,23 +2237,65 @@ OP2GPUUserClient::gemNew(struct msm_gem_new *req)
 			break;
 		}
 	}
+	static uint32_t refusals;
 	if (slot == -1) {
 		IOLockUnlock(fLock);
+		if (refusals++ < 20)
+			IOLog("OP2 GPU Client: gemNew %llu bytes refused: all %u buffer slots in use\n", req->size,
+			      OP2_GPU_MAX_BUFFERS);
 		return kIOReturnNoSpace;
 	}
 
-	IOBufferMemoryDescriptor *desc = IOBufferMemoryDescriptor::inTaskWithOptions(
-		kernel_task,
-		kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
-		(vm_size_t)(aligned_size + OP2_GPU_GUARD),
-		4096);
+	IOMemoryDescriptor *desc = NULL;
+	void *kaddr = NULL;
+	uint64_t phys = 0, pool_off = 0, pool_len = 0;
+	if (gPool && aligned_size >= OP2_GPU_POOL_MIN) {
+		uint64_t len = (aligned_size + OP2_GPU_GUARD + OP2_GPU_POOL_GRANULE - 1) & ~(OP2_GPU_POOL_GRANULE - 1);
+		if (op2_pool_alloc(len, &pool_off)) {
+			desc = IOSubMemoryDescriptor::withSubRange(gPool, (IOByteCount)pool_off, (IOByteCount)len,
+			                                            kIODirectionInOut);
+			if (desc) {
+				pool_len = len;
+				kaddr = gPoolKaddr + pool_off;
+				phys = gPoolPhys + pool_off;
+			} else {
+				op2_pool_free(pool_off, len);
+			}
+		}
+	}
+	if (!desc) {
+		/* G5b: below 4 GB (the identity map's GPU addresses are 32-bit), physically contiguous */
+		IOBufferMemoryDescriptor *bmd = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+			kernel_task,
+			kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+			(vm_size_t)(aligned_size + OP2_GPU_GUARD),
+			0x00000000FFFFF000ULL);
+		if (bmd) {
+			desc = bmd;
+			kaddr = bmd->getBytesNoCopy();
+			phys = (uint64_t)bmd->getPhysicalAddress();
+		}
+	}
 	if (!desc) {
 		IOLockUnlock(fLock);
+		if (refusals++ < 20)
+		{
+			uint64_t pfree = 0, plargest = 0;
+			if (gPoolLock) {
+				IOLockLock(gPoolLock);
+				for (unsigned i = 0; i < gPoolNFree; i++) {
+					pfree += gPoolFree[i].len;
+					if (gPoolFree[i].len > plargest)
+						plargest = gPoolFree[i].len;
+				}
+				IOLockUnlock(gPoolLock);
+			}
+			IOLog("OP2 GPU Client: gemNew %llu bytes refused: no contiguous memory below 4 GB (held %llu bytes; "
+			      "pool %llu MB, free %llu KB in %u ranges, largest %llu KB)\n", req->size, gHeldBytes,
+			      gPoolBytes >> 20, pfree >> 10, gPoolNFree, plargest >> 10);
+		}
 		return kIOReturnNoMemory;
 	}
-
-	void *kaddr = desc->getBytesNoCopy();
-	uint64_t phys = (uint64_t)desc->getPhysicalAddress();
 
 	bzero(kaddr, (size_t)aligned_size);
 	flushDcache((vm_offset_t)kaddr, (vm_size_t)aligned_size);
@@ -2094,6 +2307,8 @@ OP2GPUUserClient::gemNew(struct msm_gem_new *req)
 	fBuffers[slot].size = aligned_size;
 	fBuffers[slot].alloc_size = aligned_size + OP2_GPU_GUARD;
 	fBuffers[slot].owned = true;
+	fBuffers[slot].pool_off = pool_off;
+	fBuffers[slot].pool_len = pool_len;
 	fBuffers[slot].flags = req->flags;
 	fBuffers[slot].fence = 0;
 	fBuffers[slot].in_use = true;
@@ -2104,8 +2319,8 @@ OP2GPUUserClient::gemNew(struct msm_gem_new *req)
 	static uint32_t sGemNewLogged = 0;
 	if (sGemNewLogged < 4 || aligned_size >= (4ULL << 20)) {   /* first few, and big ones */
 		sGemNewLogged++;
-		IOLog("OP2 GPU Client: gemNew handle %u (size %llu bytes, phys 0x%llx)\n",
-		      req->handle, aligned_size, phys);
+		IOLog("OP2 GPU Client: gemNew handle %u (size %llu bytes, phys 0x%llx%s)\n",
+		      req->handle, aligned_size, phys, pool_len ? ", pool" : "");
 	}
 
 	IOLockUnlock(fLock);
@@ -2255,12 +2470,45 @@ OP2GPUUserClient::gemSubmit(struct msm_gem_submit *req)
 
 	IOLockLock(fLock);
 
-	/* 1. Flush CPU cache lines for all buffers named in the BO table */
+	/*
+	 * 1. CPU cache lines of the buffers named in the BO table.
+	 * This used to clean+invalidate EVERY buffer in full on every submission: the 11 MB screen surface, the 28 MB
+	 * wallpaper target, every texture (docs/FABLE-REVIEW.md A4). Buffers made by gemNew (owned) are mapped
+	 * write-combined into the client (clientMemoryForType) and were cleaned once when made: they have no dirty
+	 * lines, so they are skipped. Surfaces (not owned) are cached memory a CPU may have drawn into: small ones are
+	 * still cleaned here; large ones rely on the clean at IOSurface unlock (OP2Surface, metal>=2). gpu_clean=1
+	 * restores the old behaviour. The bytes cleaned and skipped are logged every 512 submissions.
+	 */
+	/* Round fable-18: skipping ALL owned buffers hung the GPU (their userland mappings hold dirty lines). Round
+	 * fable-30: cleaning everything cost ~28 MB of dc civac per submission (the panel stalled). Now: an owned buffer
+	 * is cleaned only if the client has mapped it (user_mapped, set in clientMemoryForType: a buffer only the GPU
+	 * fills was cleaned once by gemNew and holds no CPU lines); a surface is skipped under metal>=2 (a CPU writer's
+	 * lines are cleaned at IOSurface unlock, OP2Surface). gpu_clean=1: clean everything, as before. */
+	static uint32_t gpu_clean_all = 0, gpu_clean_parsed = 0, gpu_metal = 0;
+	static uint64_t sCleaned, sSkipped;
+	static uint32_t sSubmits;
+	if (!gpu_clean_parsed) {
+		gpu_clean_parsed = 1;
+		PE_parse_boot_argn("gpu_clean", &gpu_clean_all, sizeof(gpu_clean_all));
+		PE_parse_boot_argn("metal", &gpu_metal, sizeof(gpu_metal));
+		if (gpu_metal < 2)
+			gpu_clean_all = 1;   /* the surface rule needs the unlock clean, which is metal>=2 only */
+	}
 	for (uint32_t i = 0; i < req->nr_bos; i++) {
 		struct op2_gpu_client_buffer *b = getBuffer(bos[i].handle);
 		if (b && b->kernel_addr) {
-			flushDcache((vm_offset_t)b->kernel_addr, (vm_size_t)b->size);
+			if (gpu_clean_all || (b->owned && b->user_mapped)) {
+				flushDcache((vm_offset_t)b->kernel_addr, (vm_size_t)b->size);
+				sCleaned += b->size;
+			} else {
+				sSkipped += b->size;
+			}
 		}
+	}
+	if ((++sSubmits & 511) == 0) {
+		IOLog("OP2 GPU: 512 submissions: cache cleaned over %llu KB, skipped %llu KB\n", sCleaned >> 10,
+		      sSkipped >> 10);
+		sCleaned = sSkipped = 0;
 	}
 
 	/* 2. Process each command buffer and submit as indirect buffer */
@@ -2363,6 +2611,7 @@ OP2GPUUserClient::clientMemoryForType(UInt32 type,
 	}
 	b->desc->retain();
 	*memory = b->desc;
+	b->user_mapped = true;   /* from now on its lines may be dirty: gemSubmit cleans it */
 	/* write-combined, as freedreno/hakios expect (no CPU cache maintenance in userland) */
 	*options = (b->flags & 1) ? kIOMapInhibitCache : kIOMapWriteCombineCache;
 	IOLockUnlock(fLock);

@@ -33,6 +33,36 @@
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
+#include <pexpert/pexpert.h>
+
+/*
+ * G5b: with CoreAnimation on the GPU (metal=2 or more), a surface's pages are written by the GPU, which does not see
+ * the CPU's caches, and written by CPU writers (SpringBoard drawing a layer) through cached mappings and then read by the GPU. On a writer's unlock its lines are cleaned to RAM (as hakios does
+ * before GPU use), so the GPU samples what the CPU drew.
+ */
+static inline void
+op2_civac(vm_offset_t va, vm_size_t size)
+{
+	vm_offset_t addr = va & ~63ULL;
+	vm_offset_t end = (va + size + 63ULL) & ~63ULL;
+	__asm__ volatile("dsb sy" ::: "memory");
+	while (addr < end) {
+		__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+		addr += 64;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static bool
+op2_gpu_renders(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		uint32_t metal_level = 0;
+		cached = PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2;
+	}
+	return cached != 0;
+}
 #include <libkern/c++/OSUnserialize.h>
 #include <sys/proc.h>
 
@@ -58,6 +88,8 @@ enum {
 	kOP2SurfaceLock               = 2,
 	kOP2SurfaceUnlock             = 3,
 	kOP2SurfaceLookup             = 4,
+	kOP2SurfaceSetValues          = 9,
+	kOP2SurfaceCopyValues         = 10,
 	kOP2SurfaceLimits             = 13,
 	kOP2SurfaceLookupFromPort     = 34,
 	kOP2SurfaceCreatePort         = 35,
@@ -82,6 +114,14 @@ enum {
 #define OP2_SURFACE_ROW_ALIGN         64
 #define OP2_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
 #define OP2_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+/*
+ * The values (IOSurfaceSetValue/CopyAllValues). IOSurface.framework (12.5.7, IOSurfaceClient copyAllValues) reads
+ * the state page first: +0x18 is a generation it compares with the one it cached, +0x20 the serialized size it
+ * sizes its buffer by, and while +0x20 is 0 it answers NULL WITHOUT asking the kernel. CoreVideo hands that NULL to
+ * CFDictionaryApplyFunction: SpringBoard's Settings > Wallpaper crash (rounds fable-30..32, CoreVideo+0x18fe0).
+ */
+#define OP2_SURFACE_STATE_VALUES_GEN  0x18
+#define OP2_SURFACE_STATE_VALUES_SIZE 0x20
 #define kIOSurfaceLockReadOnly        0x1
 
 static IOLock      *op2_surface_lock;
@@ -160,6 +200,11 @@ OP2Surface::free()
 	}
 	OSSafeReleaseNULL(kernelMap);
 	OSSafeReleaseNULL(memory);
+	if (poolLen) {
+		op2_gpu_pool_give(poolOff, poolLen);   /* after the descriptor (and any mapping of it) is gone */
+		poolLen = 0;
+	}
+	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(state);
 	OSObject::free();
 }
@@ -287,6 +332,40 @@ op2_surface_init_lock(void)
 	}
 }
 
+
+/* The values serialized as IOCFUnserializeBinary reads them (an empty dictionary when none were set). */
+static OSSerialize *
+op2_surface_values_serialize(OP2Surface *s)
+{
+	OSSerialize *ser = OSSerialize::binaryWithCapacity(256);
+	if (ser == NULL) {
+		return NULL;
+	}
+	OSDictionary *empty = s->values == NULL ? OSDictionary::withCapacity(1) : NULL;
+	OSDictionary *d = s->values != NULL ? s->values : empty;
+	bool ok = d != NULL && d->serialize(ser);
+	OSSafeReleaseNULL(empty);
+	if (!ok) {
+		ser->release();
+		return NULL;
+	}
+	return ser;
+}
+
+/* Bump the generation and publish the size (call with op2_surface_lock held, or before the surface is shared). */
+static void
+op2_surface_values_changed(OP2Surface *s)
+{
+	uint8_t *page = (uint8_t *)s->state->getBytesNoCopy();
+	OSSerialize *ser = op2_surface_values_serialize(s);
+	uint32_t size = ser != NULL ? ser->getLength() + 8 : 64;
+	OSSafeReleaseNULL(ser);
+	*(volatile uint32_t *)(void *)(page + OP2_SURFACE_STATE_VALUES_SIZE) = size;
+	OSIncrementAtomic((volatile SInt32 *)(void *)(page + OP2_SURFACE_STATE_VALUES_GEN));
+}
+
+static OP2Surface *op2_surface_alloc(void);
+
 static OP2Surface *
 op2_surface_alloc(void)
 {
@@ -304,6 +383,7 @@ op2_surface_alloc(void)
 	}
 	bzero(s->state->getBytesNoCopy(), page_size);
 	*op2_surface_seed(s) = 1;
+	op2_surface_values_changed(s);   /* an empty dictionary, generation 1: what a real surface answers */
 	return s;
 }
 
@@ -509,6 +589,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
 	IOReturn addRef(OP2Surface *s, OP2SurfaceRef **refOut, bool *existing);
 	IOReturn returnSurface(OP2Surface *s, IOExternalMethodArguments *args);
 	IOReturn create(IOExternalMethodArguments *args);
+	IOReturn setValues(IOExternalMethodArguments *args);
+	IOReturn copyValues(IOExternalMethodArguments *args);
 
 public:
 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
@@ -704,6 +786,23 @@ op2_surface_fill_result(OP2Surface *s, OP2SurfaceRef *ref, uint8_t *out)
 	}
 }
 
+/*
+ * A structure over 4 KB comes as a memory descriptor that IOKit has NOT wired: readBytes/writeBytes on it without
+ * prepare() panics in IOGeneralMemoryDescriptor::dmaCommandOperation ("IOGMD: not wired for the IODMACommand",
+ * round fable-39: a 1242x2208 surface's values copied out by SpringBoard).
+ */
+static IOReturn
+op2_desc_io(IOMemoryDescriptor *md, bool write, void *buf, uint64_t len)
+{
+	IOReturn ret = md->prepare();
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	uint64_t done = write ? md->writeBytes(0, buf, len) : md->readBytes(0, buf, len);
+	md->complete();
+	return done == len ? kIOReturnSuccess : kIOReturnIOError;
+}
+
 static IOReturn
 op2_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
 {
@@ -712,7 +811,10 @@ op2_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
 		if (copy_len > args->structureOutputDescriptor->getLength()) {
 			copy_len = (uint32_t)args->structureOutputDescriptor->getLength();
 		}
-		args->structureOutputDescriptor->writeBytes(0, buf, copy_len);
+		IOReturn wr = op2_desc_io(args->structureOutputDescriptor, true, (void *)(uintptr_t)buf, copy_len);
+		if (wr != kIOReturnSuccess) {
+			return wr;
+		}
 		args->structureOutputDescriptorSize = copy_len;
 		return kIOReturnSuccess;
 	}
@@ -756,6 +858,117 @@ IOSurfaceRootUserClient::returnSurface(OP2Surface *s, IOExternalMethodArguments 
 	return ret;
 }
 
+/*
+ * sel 9, IOSurfaceSetValue/SetValues: struct in = u32 surface id, u32 pad, then a binary-serialized array --
+ * [value, key] for one value, [dictionary] for many (IOSurfaceClient setValue:forKey:, 12.5.7). Scalar out: one u32.
+ */
+IOReturn
+IOSurfaceRootUserClient::setValues(IOExternalMethodArguments *args)
+{
+	uint32_t len = args->structureInputSize;
+	const char *buf = (const char *)args->structureInput;
+	char *copy = NULL;
+	if (args->structureInputDescriptor != NULL) {
+		len = (uint32_t)args->structureInputDescriptor->getLength();
+		if (len < 8 || len > OP2_SURFACE_MAX_PROPS || (copy = (char *)IOMallocData(len)) == NULL) {
+			return kIOReturnBadArgument;
+		}
+		if (op2_desc_io(args->structureInputDescriptor, false, copy, len) != kIOReturnSuccess) {
+			IOFreeData(copy, len);
+			return kIOReturnVMError;
+		}
+		buf = copy;
+	}
+	IOReturn ret = kIOReturnBadArgument;
+	OSObject *obj = NULL;
+	OP2Surface *s = NULL;
+	if (buf != NULL && len > 8) {
+		s = op2_surface_copy(get32((const uint8_t *)buf, 0));
+		obj = OSUnserializeXML(buf + 8, len - 8);
+	}
+	OSArray *arr = OSDynamicCast(OSArray, obj);
+	if (s != NULL && arr != NULL) {
+		OSDictionary *many = arr->getCount() == 1 ? OSDynamicCast(OSDictionary, arr->getObject(0)) : NULL;
+		OSString *key = arr->getCount() == 2 ? OSDynamicCast(OSString, arr->getObject(1)) : NULL;
+		OSObject *value = arr->getCount() == 2 ? arr->getObject(0) : NULL;
+		if (many != NULL || (key != NULL && value != NULL)) {
+			IOLockLock(op2_surface_lock);
+			if (s->values == NULL) {
+				s->values = OSDictionary::withCapacity(4);
+			}
+			if (s->values != NULL) {
+				if (many != NULL) {
+					s->values->merge(many);
+				} else {
+					s->values->setObject(key, value);
+				}
+				op2_surface_values_changed(s);
+				ret = kIOReturnSuccess;
+			}
+			IOLockUnlock(op2_surface_lock);
+		}
+	}
+	if (ret != kIOReturnSuccess) {
+		IOLog("OP2 SURF: set values: surface %u, %u bytes, %s (%u objects): not stored\n",
+		    buf != NULL && len >= 4 ? get32((const uint8_t *)buf, 0) : 0, len,
+		    obj != NULL ? obj->getMetaClass()->getClassName() : "nothing", arr != NULL ? arr->getCount() : 0);
+	}
+	OSSafeReleaseNULL(obj);
+	OSSafeReleaseNULL(s);
+	if (copy != NULL) {
+		IOFreeData(copy, len);
+	}
+	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+		args->scalarOutput[i] = 0;
+	}
+	op2_surf_log_once("sel", kOP2SurfaceSetValues);
+	return ret;
+}
+
+/*
+ * sel 10, IOSurfaceCopyAllValues (and CopyValue, which looks its key up in the copy): struct in = u32 surface id,
+ * pad, u8 at +8; struct out = 8 header bytes, then the binary-serialized dictionary. A buffer too small gets
+ * kIOReturnNoSpace, and the library grows it and asks again.
+ */
+IOReturn
+IOSurfaceRootUserClient::copyValues(IOExternalMethodArguments *args)
+{
+	if (args->structureInput == NULL || args->structureInputSize < 4) {
+		return kIOReturnBadArgument;
+	}
+	OP2Surface *s = op2_surface_copy(get32((const uint8_t *)args->structureInput, 0));
+	if (s == NULL) {
+		return kIOReturnNotFound;
+	}
+	IOLockLock(op2_surface_lock);
+	OSSerialize *ser = op2_surface_values_serialize(s);
+	IOLockUnlock(op2_surface_lock);
+	s->release();
+	if (ser == NULL) {
+		return kIOReturnNoMemory;
+	}
+	uint32_t n = ser->getLength(), total = n + 8;
+	uint32_t room = args->structureOutputDescriptor != NULL ? (uint32_t)args->structureOutputDescriptor->getLength() :
+	    args->structureOutputSize;
+	IOReturn ret;
+	if (room < total) {
+		ret = kIOReturnNoSpace;
+	} else {
+		uint8_t *out = (uint8_t *)IOMallocData(total);
+		if (out == NULL) {
+			ret = kIOReturnNoMemory;
+		} else {
+			bzero(out, 8);
+			bcopy(ser->text(), out + 8, n);
+			ret = op2_struct_out(args, out, total);
+			IOFreeData(out, total);
+		}
+	}
+	ser->release();
+	op2_surf_log_once("sel", kOP2SurfaceCopyValues);
+	return ret;
+}
+
 IOReturn
 IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 {
@@ -773,7 +986,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		if (copy == NULL) {
 			return kIOReturnNoMemory;
 		}
-		args->structureInputDescriptor->readBytes(0, copy, len);
+		if (op2_desc_io(args->structureInputDescriptor, false, copy, len) != kIOReturnSuccess) {
+			IOFreeData(copy, len);
+			return kIOReturnVMError;
+		}
 		buf = copy;
 	}
 	OSObject *obj = (buf != NULL && len > 0) ? OSUnserializeXML(buf, len) : NULL;
@@ -819,11 +1035,35 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 					s->kernelBuffer = (void *)s->kernelMap->getVirtualAddress();
 				}
 			}
+		} else if (op2_gpu_renders() &&
+		           op2_gpu_pool_take(s->allocSize, &mem, &s->kernelBuffer, &s->poolOff, &s->poolLen)) {
+			/* G5c: from the GPU pool (contiguous, below 4 GB): see op2_gpu_pool_take */
+			s->mapCache = kIOMapDefaultCache;
 		} else {
+			if (op2_gpu_renders())
+				IOLog("OP2 SURF: %ux%u (%u bytes) not from the GPU pool (full?): contiguous or scattered\n",
+				    s->width, s->height, s->allocSize);
 			if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&op2_surface_wired) +
 			    s->allocSize <= OP2_SURFACE_WIRED_MAX) {
-				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+				/*
+				 * G5b: with CoreAnimation on the GPU (metal=2 or more) a surface is a render target, and the GPU
+				 * addresses it by physical address (OP2GPU's identity map): it must be physically contiguous and
+				 * below 4 GB (32-bit GPU addresses). Round g5b-4: backboardd's 1242x2208 surface came in 2760
+				 * pieces and the GPU was handed the first one's address. Contiguous when it can be; the old
+				 * allocation (and OP2GPU's "NOT physically contiguous" warning) when not.
+				 */
+				uint32_t metal_level = 0;
+				if (PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2) {
+					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+					    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+					    s->allocSize, 0x00000000FFFFF000ULL);
+					if (mem == NULL)
+						IOLog("OP2 SURF: no contiguous memory below 4 GB for %u bytes (%ux%u): scattered\n",
+						    s->allocSize, s->width, s->height);
+				}
+				if (mem == NULL)
+					mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+					    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
 			}
 			if (mem == NULL) {
 				OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&op2_surface_wired);
@@ -837,6 +1077,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		if (mem != NULL) {
 			if (s->kernelBuffer != NULL && carveout_phys == 0) {
 				bzero(s->kernelBuffer, s->allocSize);
+				if (s->poolLen)   /* the zeros through a cached alias: to RAM before the GPU reads it */
+					op2_civac((vm_offset_t)s->kernelBuffer, (vm_size_t)s->allocSize);
 			}
 			s->memory = mem;
 			if (!op2_surface_publish(s)) {
@@ -947,6 +1189,8 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 			new_seed = op2_surface_get_seed(s);
 		} else {
 			new_seed = OSIncrementAtomic((volatile SInt32 *)op2_surface_seed(s)) + 1;
+			if (op2_gpu_renders() && s->kernelBuffer != NULL)
+				op2_civac((vm_offset_t)s->kernelBuffer, (vm_size_t)s->allocSize);
 		}
 		__asm__ volatile("dmb sy" ::: "memory");
 		static uint32_t op2_surf_unlocks_logged = 0;
@@ -1014,6 +1258,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		op2_surf_log_once("sel", selector);
 		return kIOReturnSuccess;
 	}
+	case kOP2SurfaceSetValues:
+		return setValues(args);
+	case kOP2SurfaceCopyValues:
+		return copyValues(args);
 	default:
 		/* Values, notifications, ownership, timestamps: accept and ignore. */
 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

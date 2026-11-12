@@ -44,6 +44,36 @@
 #include <sys/proc.h>
 #include "apple_logo.h"
 
+/*
+ * G5b: with CoreAnimation on the GPU (metal=2 or more), a surface's pages are written by the GPU, which does not see
+ * the CPU's caches, and read by the CPU here through a cached mapping. Clean+invalidate the range first, so the CPU
+ * reads what the GPU wrote (round g5b-11: after the first frame the panel kept showing stale cached pixels, and the
+ * phone looked frozen while backboardd drew new frames), and no dirty line from the CPU lands on top of it later.
+ */
+static inline void
+op2_civac(vm_offset_t va, vm_size_t size)
+{
+	vm_offset_t addr = va & ~63ULL;
+	vm_offset_t end = (va + size + 63ULL) & ~63ULL;
+	__asm__ volatile("dsb sy" ::: "memory");
+	while (addr < end) {
+		__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+		addr += 64;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static bool
+op2_gpu_renders(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		uint32_t metal_level = 0;
+		cached = PE_parse_boot_argn("metal", &metal_level, sizeof(metal_level)) && metal_level >= 2;
+	}
+	return cached != 0;
+}
+
 #ifndef IOMallocData
 #define IOMallocData(sz) IOMalloc(sz)
 #endif
@@ -367,6 +397,60 @@ op2_measure_cpu_mhz(void)
  * Every precondition is checked; any surprise aborts before step 3.
  * boot-arg op2_cpuboost=0 disables.
  */
+/*
+ * Thermal throttle (op2_snapshot.c op2_thermal_thread): back to the LK clock path (PLL0 /2, 768 MHz) and up again.
+ * Lowering the clock at the TURBO voltage is always safe; the voltage stays where the boost put it.
+ */
+static volatile uint32_t *op2_boost_glb, *op2_boost_saw;
+static uint32_t op2_boost_mux_fast, op2_boost_mux_slow, op2_vlevel_fast, op2_vlevel_slow;
+
+static bool
+op2_apc0_set_vlevel(uint32_t v)
+{
+	op2_boost_saw[0x1c / 4] = v;
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (int i = 0; i < 500; i++) {
+		if ((op2_boost_saw[0x14 / 4] & 0xff) == v) {
+			return true;
+		}
+		IODelay(1);
+	}
+	return false;
+}
+
+/*
+ * Thermal throttle (op2_snapshot.c op2_thermal_thread). On: clock down to the LK path (PLL0 /2, 768 MHz) FIRST, then
+ * APC0 back to LK's voltage -- round fable-45 showed the A53 cores (TSENS 7..10) still climbing at idle at 768 MHz
+ * with the TURBO 1.145 V left on: leakage, not load. Off: voltage up and confirmed FIRST, then the clock; if the
+ * PMIC does not confirm, the clock stays down.
+ */
+extern "C" int op2_cpu_set_throttle(int on);
+extern "C" int
+op2_cpu_set_throttle(int on)
+{
+	if (op2_boost_glb == NULL) {
+		return 0;   /* never boosted: already at 768 MHz and LK's voltage */
+	}
+	if (on) {
+		op2_boost_glb[0x54 / 4] = op2_boost_mux_slow;
+		__asm__ volatile("dsb sy; isb" ::: "memory");
+		IODelay(10);
+		if (op2_vlevel_slow && !op2_apc0_set_vlevel(op2_vlevel_slow)) {
+			IOLog("OP2 THERM: APC0 did not confirm vlevel 0x%x\n", op2_vlevel_slow);
+		}
+	} else {
+		if (!op2_apc0_set_vlevel(op2_vlevel_fast)) {
+			IOLog("OP2 THERM: APC0 did not confirm TURBO vlevel 0x%x: staying at 768 MHz\n", op2_vlevel_fast);
+			return (int)op2_measure_cpu_mhz();
+		}
+		IODelay(300);   /* slew up, as the boost does */
+		op2_boost_glb[0x54 / 4] = op2_boost_mux_fast;
+		__asm__ volatile("dsb sy; isb" ::: "memory");
+		IODelay(10);
+	}
+	return (int)op2_measure_cpu_mhz();
+}
+
 extern "C" uint32_t op2_measure_cpu_mhz(void);
 static void
 op2_cpu_boost(void)
@@ -412,6 +496,7 @@ op2_cpu_boost(void)
 
 	/* 2. APC0 voltage: FTS2 range0, 5 mV/step from 0 V. */
 	const uint32_t vlevel = 1145000 / 5000;   /* 0xE5 = 1.145 V */
+	uint32_t vlevel_lk = saw[0x14 / 4] & 0xff;   /* what LK left (NOMINAL, ~1.0 V): the throttle returns to it */
 	if (saw[0x08 / 4] == 0) {
 		saw[0x08 / 4] = 0x01;                 /* SAW2_CFG per DT (qcom,saw2-cfg) */
 	}
@@ -437,6 +522,20 @@ op2_cpu_boost(void)
 	/* 3. HF mux -> PLL0 full rate. */
 	uint32_t newmux = (mux & ~(3u << 3)) | (3u << 3);
 	glb[0x54 / 4] = newmux;
+	op2_boost_glb = glb;
+	op2_boost_saw = saw;
+	op2_boost_mux_fast = newmux;
+	op2_boost_mux_slow = mux;
+	op2_vlevel_fast = vlevel;
+	/* PMIC_STS reads 0 before the first VCTL write (round fable-46): then LK's documented NOMINAL 1.0 V (0xC8),
+	 * the stock voltage LK itself runs 768 MHz at */
+	op2_vlevel_slow = (vlevel_lk >= 0xb4 && vlevel_lk < vlevel) ? vlevel_lk : 1000000 / 5000;
+	IOLog("OP2 BOOST: throttle returns to vlevel 0x%x (LK's)\n", op2_vlevel_slow);
+	extern int op2_temp_throttled;   /* op2_snapshot.c: already too hot when the boost ran -> back down at once */
+	if (op2_temp_throttled) {
+		IOLog("OP2 BOOST: thermal throttle active: back to 768 MHz\n");
+		op2_cpu_set_throttle(1);
+	}
 	__asm__ volatile("dsb sy; isb" ::: "memory");
 	IODelay(10);
 	uint32_t mhz = op2_measure_cpu_mhz();
@@ -1242,6 +1341,12 @@ AppleCLCD::present(const uint8_t *rec)
 
 		uintptr_t src = s->kernelAddress();
 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+		if (src != 0 && op2_gpu_renders() && s->memory != NULL && s->offset < s->memory->getLength()) {
+			uint64_t len = (uint64_t)s->bytesPerRow * s->height;
+			if (s->offset + len > s->memory->getLength())
+				len = s->memory->getLength() - s->offset;
+			op2_civac((vm_offset_t)(src + s->offset), (vm_size_t)len);
+		}
 		if (src != 0 && bpe == 4 && dstPixels != 0) {
 			if (s->width == 1242 && s->height == 2208) {
 				static uint32_t sy_map[1920];

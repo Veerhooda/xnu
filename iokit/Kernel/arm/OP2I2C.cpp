@@ -377,8 +377,14 @@ OP2I2C::pollLoop(void)
 {
 	bool prevDown = false;
 	bool homeTouch = false;
-	uint32_t kHomeStripY = 1880;
+	/* 1850 (was 1880): round fable-30, several Home attempts started at y 1847..1869 and were taps instead */
+	uint32_t kHomeStripY = 1850;
 	PE_parse_boot_argn("op2_homey", &kHomeStripY, sizeof(kHomeStripY));
+	/* op2hs=0 (Home strip): no virtual Home key, every touch goes to iOS. For the iPhone X gesture navigation
+	 * (MobileGestalt HomeButtonType 2): SpringBoard's own home gesture wants the swipe from the bottom edge. */
+	uint32_t homeStrip = 1;
+	PE_parse_boot_argn("op2hs", &homeStrip, sizeof(homeStrip));
+	IOLog("OP2I2C: virtual Home strip %s (y >= %u)\n", homeStrip ? "on" : "off", kHomeStripY);
 	uint32_t lastX = 0, lastY = 0;
 	uint32_t polls = 0, posts = 0, moveLogs = 0;
 	uint32_t errCount = 0;
@@ -451,7 +457,7 @@ OP2I2C::pollLoop(void)
 			 * Home. Old code: any y>1820 was BOTH a tap and a Home press.
 			 */
 			if (down && !prevDown) {
-				homeTouch = (py >= kHomeStripY && px > 300 && px < 780);
+				homeTouch = homeStrip && (py >= kHomeStripY && px > 250 && px < 830);
 			}
 			if (homeTouch) {
 				if (down != prevDown) {

@@ -28,6 +28,7 @@
 extern void proc_name_kdp(task_t task, char * buf, int size);
 extern int proc_pid_kdp(task_t task);
 extern void IOSleep(unsigned milliseconds);
+extern int op2_temp_max, op2_temp_throttled;   /* op2_thermal_thread, below */
 
 void op2_threaddump_start(void);
 
@@ -304,8 +305,8 @@ op2_top_sample(uint64_t interval_abs)
 		if (secs == 0) {
 			secs = 1;
 		}
-		int len = snprintf(line, sizeof(line), "OP2 TOP: %uMHz busy %llu%%/400 emmc %lluKB/s (%llu multi):",
-		    op2_cpu_mhz_now, (sum * 100ULL) / interval_abs,
+		int len = snprintf(line, sizeof(line), "OP2 TOP: %uMHz T%dC%s busy %llu%%/400 emmc %lluKB/s (%llu multi):",
+		    op2_cpu_mhz_now, op2_temp_max, op2_temp_throttled ? "!" : "", (sum * 100ULL) / interval_abs,
 		    ((blk - op2_top_last_blk) / 2ULL) / secs, mcmd - op2_top_last_mcmd);
 		op2_top_last_blk = blk;
 		op2_top_last_mcmd = mcmd;
@@ -337,6 +338,184 @@ op2_top_sample(uint64_t interval_abs)
 		op2_top_prev[i] = op2_top_cur[i];
 	}
 	op2_top_prev_n = n;
+}
+
+/*
+ * THERMAL (2026-11-13): the user reported the phone "superhot"; nothing in this kernel read a temperature. TSENS
+ * (msm8994: TYPE2 controller at 0xfc4a8000, 16 sensors, status 0x1044 + 4n: 10-bit code, VALID 0x4000; fuses at
+ * 0xfc4bc000 + 0xd0, reference drivers/thermal/msm8974-tsens.c tsens_calib_8994_sensors). Every 2 s: the hottest
+ * sensor. Above op2_thot (default 70 C) the A53s drop from 1536 to 768 MHz and LK's voltage (op2_cpu_set_throttle), up below
+ * op2_thot - 10. Above op2_tcrit (default 90 C) twice in a row: sync, dump, panic -> reset to TWRP, whose kernel
+ * does thermal management. The OP2 TOP line carries "T<max>C" (and a "T!" while throttled).
+ * Boot-args: op2_therm=0 off, op2_thot, op2_tcrit.
+ */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern int op2_cpu_set_throttle(int on);
+extern void op2_fs_sync(void);
+static volatile uint32_t *op2_tsens, *op2_tsens_fuse;
+static int32_t op2_t_slope[16], op2_t_offset[16];   /* x1000, as the Linux driver */
+static int op2_t_calibrated;
+int op2_temp_max = -1000;                             /* last hottest reading, C (shown on OP2 TOP) */
+int op2_temp_throttled;
+
+static const int32_t op2_t_dt_slope[16] = { 2901, 2846, 3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200, 3200,
+	3200, 3200, 3200, 3200 };
+
+static void
+op2_tsens_calibrate(void)
+{
+	uint32_t d0 = op2_tsens_fuse[0xd0 / 4], d1 = op2_tsens_fuse[0xd4 / 4], d2 = op2_tsens_fuse[0xd8 / 4];
+	uint32_t redun = (op2_tsens_fuse[0x464 / 4] & 0xe0000000u) >> 29;
+	uint32_t mode = (d2 & 0x700000u) >> 20;
+	int32_t point[16], base0 = 0, base1 = 0;
+	if (redun != 3 && mode == 3) {
+		base0 = (int32_t)(d0 & 0x3ff);
+		base1 = (int32_t)((d0 & 0xffc00) >> 10);
+		point[0] = (d0 >> 20) & 0xf; point[1] = (d0 >> 24) & 0xf; point[2] = (d0 >> 28) & 0xf;
+		for (int i = 0; i < 8; i++)
+			point[3 + i] = (d1 >> (4 * i)) & 0xf;
+		for (int i = 0; i < 5; i++)
+			point[11 + i] = (d2 >> (4 * i)) & 0xf;
+		op2_t_calibrated = 1;
+	} else {
+		for (int i = 0; i < 16; i++)
+			point[i] = 532;
+	}
+	for (int i = 0; i < 16; i++) {
+		op2_t_slope[i] = op2_t_calibrated ? (base1 - base0) * 1000 / 90 : op2_t_dt_slope[i];
+		if (op2_t_slope[i] <= 0)
+			op2_t_slope[i] = op2_t_dt_slope[i];
+		op2_t_offset[i] = (base0 + point[i]) * 1000 - 30 * op2_t_slope[i];
+	}
+	printf("OP2 THERM: TSENS fuses %08x %08x %08x redun %u mode %u: %s (base %d/%d)\n", d0, d1, d2, redun, mode,
+	    op2_t_calibrated ? "two-point calibrated" : "uncalibrated defaults", base0, base1);
+}
+
+/* one sensor in C, or -1000 when it never reads valid */
+static int
+op2_tsens_read(int n)
+{
+	for (int tries = 0; tries < 3; tries++) {
+		uint32_t v = op2_tsens[(0x1044 + 4 * n) / 4];
+		if (v & 0x4000) {
+			int32_t code = (int32_t)(v & 0x3ff);
+			int32_t num = code * 1000 - op2_t_offset[n];
+			return (num >= 0 ? num + op2_t_slope[n] / 2 : num - op2_t_slope[n] / 2) / op2_t_slope[n];
+		}
+	}
+	return -1000;
+}
+
+/*
+ * USB probe, READ-ONLY (docs/USB-CONSOLE-PLAN.md step 1, 2026-11-13). TWRP shows f9200000.dwc3 is the port's
+ * controller; LK's fastboot used it to receive our image, so its power and clocks may still be on. Log the GDSC,
+ * the GCC clock branches and, only if the core is powered and clocked (a gated block's registers can hang the
+ * bus), the DWC3 global/device registers and the QSCRATCH HS PHY controls. Boot-arg op2usb=0 skips it.
+ */
+static bool
+op2_usb_probe(void)
+{
+	uint32_t en = 1;
+	PE_parse_boot_argn("op2usb", &en, sizeof(en));
+	if (!en)
+		return false;
+	volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0xfc400000, 0x2000);
+	if (!gcc) {
+		printf("OP2 USB: cannot map GCC\n");
+		return false;
+	}
+	uint32_t gdsc = gcc[0x1e84 / 4];
+	static const struct { uint32_t off; const char *name; } cb[] = {
+		{ 0x3c8, "master" }, { 0x3fc, "noc_axi" }, { 0x3d0, "mock_utmi" }, { 0x3cc, "sleep" },
+		{ 0x4ac, "hsphy_sleep" }, { 0x1a84, "phy_ahb2phy" }, { 0x1408, "ssphy_aux" }, { 0x140c, "ssphy_pipe" },
+	};
+	uint32_t v[8];
+	for (int i = 0; i < 8; i++)
+		v[i] = gcc[cb[i].off / 4];
+	printf("OP2 USB: GDSC usb30 0x%08x (%s); CBCR master %08x axi %08x utmi %08x sleep %08x hsphy %08x ahb2phy %08x ssaux %08x sspipe %08x\n",
+	    gdsc, (gdsc & 0x80000000u) ? "on" : "OFF", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+	printf("OP2 USB: RCGR master cmd %08x cfg %08x, utmi cmd %08x cfg %08x; BCR usb30 %08x hsphy %08x ssphy %08x\n",
+	    gcc[0x3d4 / 4], gcc[0x3d8 / 4], gcc[0x3e8 / 4], gcc[0x3ec / 4], gcc[0x3c0 / 4], gcc[0x4b0 / 4],
+	    gcc[0x1400 / 4]);
+	bool powered = (gdsc & 0x80000000u) != 0;
+	bool clocked = !(v[0] & 0x80000000u) && !(v[1] & 0x80000000u);   /* CLK_OFF clear on master and AXI */
+	if (!powered || !clocked) {
+		printf("OP2 USB: core %s/%s: DWC3 registers NOT read (would hang the bus)\n",
+		    powered ? "powered" : "unpowered", clocked ? "clocked" : "gated");
+		return false;
+	}
+	volatile uint32_t *d = (volatile uint32_t *)ml_io_map(0xf9200000, 0x100000);
+	if (!d) {
+		printf("OP2 USB: cannot map DWC3\n");
+		return false;
+	}
+#define R(off) d[(off) / 4]
+	printf("OP2 USB: DWC3 GSNPSID %08x GCTL %08x GSTS %08x GUSB2PHYCFG %08x GUSB3PIPECTL %08x GHWPARAMS0 %08x\n",
+	    R(0xc120), R(0xc110), R(0xc118), R(0xc200), R(0xc2c0), R(0xc140));
+	printf("OP2 USB: DCFG %08x DCTL %08x DEVTEN %08x DSTS %08x DALEPENA %08x GEVNT adr %08x:%08x siz %08x cnt %08x\n",
+	    R(0xc700), R(0xc704), R(0xc708), R(0xc70c), R(0xc720), R(0xc404), R(0xc400), R(0xc408), R(0xc40c));
+	printf("OP2 USB: QSCRATCH ctrl %08x general_cfg %08x hs_phy_ctrl %08x param_override %08x ss_phy_ctrl %08x\n",
+	    R(0xf8804), R(0xf8808), R(0xf8810), R(0xf8814), R(0xf8830));
+#undef R
+	return true;
+}
+
+static void
+op2_thermal_thread(__unused void *param, __unused wait_result_t wr)
+{
+	uint32_t hot = 70, crit = 90;   /* stock msm_thermal starts limiting the A53s at 60 C (sensor 7) */
+	PE_parse_boot_argn("op2_thot", &hot, sizeof(hot));
+	PE_parse_boot_argn("op2_tcrit", &crit, sizeof(crit));
+	op2_tsens = (volatile uint32_t *)ml_io_map(0xfc4a8000, 0x2000);
+	op2_tsens_fuse = (volatile uint32_t *)ml_io_map(0xfc4bc000, 0x1000);
+	if (!op2_tsens || !op2_tsens_fuse) {
+		printf("OP2 THERM: cannot map TSENS\n");
+		return;
+	}
+	op2_tsens_calibrate();
+	extern void op2_usb_start(void);
+	if (op2_usb_probe()) {
+		op2_usb_start();   /* bsd/dev/op2_usb.c: the CDC-ACM console (LK left the core powered and clocked) */
+	}
+	int crit_count = 0;
+	for (uint32_t tick = 0;; tick++) {
+		int t[16], mx = -1000, valid = 0;
+		for (int i = 0; i < 16; i++) {
+			t[i] = op2_tsens_read(i);
+			if (t[i] > -1000) {
+				valid++;
+				if (t[i] > mx)
+					mx = t[i];
+			}
+		}
+		op2_temp_max = mx;
+		if (tick == 150) {
+			(void)op2_usb_probe();   /* again at 5 min: the boot-time lines can be overwritten in the ramoops ring */
+		}
+		if (tick == 0 || (tick % 150) == 0) {   /* all sixteen at start and every 5 min */
+			printf("OP2 THERM: %d valid; C: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", valid, t[0], t[1],
+			    t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+		}
+		if (valid > 0 && mx > -40 && mx < 150) {   /* plausible readings only drive decisions */
+			if (!op2_temp_throttled && mx >= (int)hot) {
+				op2_temp_throttled = 1;
+				int mhz = op2_cpu_set_throttle(1);
+				printf("OP2 THERM: %d C >= %u: CPU throttled to ~%d MHz\n", mx, hot, mhz);
+			} else if (op2_temp_throttled && mx <= (int)hot - 10) {   /* 60 C with the default */
+				op2_temp_throttled = 0;
+				int mhz = op2_cpu_set_throttle(0);
+				printf("OP2 THERM: %d C: CPU back to ~%d MHz\n", mx, mhz);
+			}
+			crit_count = mx >= (int)crit ? crit_count + 1 : 0;
+			if (crit_count >= 2) {
+				printf("OP2 THERM: %d C >= %u twice: syncing and resetting to recovery\n", mx, crit);
+				op2_fs_sync();
+				IOSleep(2000);
+				panic("OP2: thermal cutoff at %d C\n", mx);
+			}
+		}
+		IOSleep(2000);
+	}
 }
 
 static uint32_t op2_top_interval = 30;
@@ -413,6 +592,14 @@ op2_threaddump_start(void)
 		return;
 	}
 	started = TRUE;
+	uint32_t therm = 1;
+	PE_parse_boot_argn("op2_therm", &therm, sizeof(therm));
+	if (therm) {
+		thread_t thth;
+		if (kernel_thread_start(op2_thermal_thread, NULL, &thth) == KERN_SUCCESS) {
+			thread_deallocate(thth);
+		}
+	}
 	PE_parse_boot_argn("op2_top", &op2_top_interval, sizeof(op2_top_interval));
 	if (op2_top_interval != 0) {
 		thread_t topth;
