@@ -379,8 +379,8 @@ OP2I2C::pollLoop(void)
 {
 	bool prevDown = false;
 	bool homeTouch = false;
-	/* 1720: comfortable virtual Home strip along the bottom edge of the display glass */
-	uint32_t kHomeStripY = 1720;
+	/* 1885: narrow virtual Home strip along the very bottom center edge (glass bezel) */
+	uint32_t kHomeStripY = 1885;
 	PE_parse_boot_argn("op2_homey", &kHomeStripY, sizeof(kHomeStripY));
 	/* op2hs=0 (Home strip): no virtual Home key, every touch goes to iOS. For the iPhone X gesture navigation
 	 * (MobileGestalt HomeButtonType 2): SpringBoard's own home gesture wants the swipe from the bottom edge. */
@@ -472,13 +472,13 @@ OP2I2C::pollLoop(void)
 			 * Home. Old code: any y>1820 was BOTH a tap and a Home press.
 			 */
 			if (down && !prevDown) {
-				uint64_t lk = op2_fb_get_last_kick();
-				bool is_idle = op2_fb_is_power_off() || (lk != 0 && (mach_absolute_time() - lk > 38400000ULL));
+				bool is_idle = op2_fb_is_power_off();
 				if (is_idle) {
 					homeTouch = true;
-					IOLog("OP2I2C: tap-to-wake: screen is idle (no kicks for >2s), waking with Home key\n");
+					IOLog("OP2I2C: tap-to-wake: screen is off, waking with Home key\n");
 				} else {
-					homeTouch = homeStrip && (py >= kHomeStripY);
+					/* Virtual Home: bottom bezel edge AND center zone (x between 420 and 660) */
+					homeTouch = homeStrip && (py >= kHomeStripY) && (px >= 420 && px <= 660);
 				}
 			}
 			if (homeTouch) {

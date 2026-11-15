@@ -701,10 +701,11 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 				sender->setTimeoutMS(3000);
 				break;
 			}
-			/* Send a synthetic micro-event every 2.5s so iOS idle timer never triggers sleep */
-			me->postDigitizerEvent(1, 0x8000, 0x8000, 0, true);
-			me->fTapStep = 21;
-			sender->setTimeoutMS(40);
+			/*
+			 * Hands-on mode: NO synthetic touch events! Screen is kept awake via op2fb_keepon=1.
+			 * Zero auto-input so user has complete, uninterrupted physical hands-on control.
+			 */
+			sender->setTimeoutMS(5000);
 			break;
 		}
 		/*
@@ -843,9 +844,8 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		break;
 
 	case 21:
-		me->postDigitizerEvent(0, 0x8000, 0x8000, 0, true);
 		me->fTapStep = 7;
-		sender->setTimeoutMS(2500);
+		sender->setTimeoutMS(5000);
 		break;
 
 	default:
