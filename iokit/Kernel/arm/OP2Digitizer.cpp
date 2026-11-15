@@ -364,7 +364,8 @@ op2_home_button_post(uint32_t down)
 {
 	if (gOP2Digitizer != NULL) {
 		gOP2Digitizer->postHomeButtonEvent(down);
-	} else if (gOP2Buttons != NULL) {
+	}
+	if (gOP2Buttons != NULL) {
 		gOP2Buttons->key(0x0040, down);
 	}
 }
@@ -460,9 +461,11 @@ OP2Digitizer::postHomeButtonEvent(uint32_t down)
 	 */
 	static uint32_t sHomePath = 0;
 	if (sHomePath == 0) {
-		sHomePath = 1;
+		sHomePath = 1;   /* Mode 1: OP2Buttons (backboardd consumer control input stream) */
 		PE_parse_boot_argn("op2_homepath", &sHomePath, sizeof(sHomePath));
 	}
+	IOLog("OP2 Home: post down=%u path=0x%x buttons=%p bqueue=%p dqueue=%p\n", down, sHomePath,
+	    gOP2Buttons, gOP2Buttons ? gOP2Buttons->getQueue() : NULL, fQueue);
 	if ((sHomePath & 1) && gOP2Buttons != NULL) {
 		gOP2Buttons->key(0x0040, down);
 		if (!(sHomePath & 2)) {
@@ -504,6 +507,9 @@ OP2Digitizer::postHomeButtonEvent(uint32_t down)
 /* External display synchronization getters from OP2Framebuffer */
 extern "C" uint32_t op2_fb_get_last_shown(void);
 extern "C" uint32_t op2_fb_get_last_nz(void);
+extern "C" bool op2_fb_is_power_off(void);
+
+static bool sHandsOnUnlocked = false;
 
 /* Unattended synthetic user: op2_tapms=N re-arms a periodic center-ish
  * tap every N ms after the one-shot setup sequence (default off = single
@@ -598,10 +604,6 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		op2_g3_tick(me, sender);
 		return;
 	}
-	if (op2_autoinput_mode == 1 && me->fTapStep != 0 && me->fTapStep != 18) {
-		IOLog("OP2 Digitizer: wake-only mode: Lock Screen is up, synthetic input stopped\n");
-		return;
-	}
 
 	switch (me->fTapStep) {
 	case 0: {
@@ -613,7 +615,7 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		 */
 		static uint32_t sPollCycles = 0;
 		sPollCycles++;
-		if (op2_fb_get_last_shown() > 0 && op2_fb_get_last_nz() >= 500) {
+		if (op2_fb_get_last_shown() >= 2 && op2_fb_get_last_nz() >= 500) {
 			IOLog("OP2 Digitizer: === LOCK SCREEN DETECTED: SpringBoard surface %u active (nz=%u) ===\n",
 			    op2_fb_get_last_shown(), op2_fb_get_last_nz());
 			/* Lock Screen clock, date, and wallpaper are actively rendering! Proceed to interaction. */
@@ -623,7 +625,7 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		if ((sPollCycles % 3) == 0) {
 			IOLog("OP2 Digitizer: pulsing Home button to wake display (poll cycle %u)...\n", sPollCycles);
-			me->postHomeButtonEvent(1);
+			op2_home_button_post(1);
 			me->fTapStep = 18;
 			sender->setTimeoutMS(120);
 			break;
@@ -650,14 +652,14 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 	case 3:
 		/* Prime / Wake Home button press */
 		IOLog("OP2 Digitizer: [LOCK SCREEN] Home button press (wake/prime)\n");
-		me->postHomeButtonEvent(1);
+		op2_home_button_post(1);
 		me->fTapStep = 4;
 		sender->setTimeoutMS(120);
 		break;
 
 	case 4:
 		IOLog("OP2 Digitizer: [LOCK SCREEN] Home button release\n");
-		me->postHomeButtonEvent(0);
+		op2_home_button_post(0);
 		/* Wait 2200ms for wake animation to finish so SpringBoard is in awake state */
 		me->fTapStep = 5;
 		sender->setTimeoutMS(2200);
@@ -670,20 +672,41 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		 * Press Home button to dismiss Lock Screen.
 		 */
 		IOLog("OP2 Digitizer: === UNLOCKING TO HOME SCREEN: pressing Home button while awake ===\n");
-		me->postHomeButtonEvent(1);
+		op2_home_button_post(1);
 		me->fTapStep = 6;
 		sender->setTimeoutMS(120);
 		break;
 
 	case 6:
 		IOLog("OP2 Digitizer: [HOME SCREEN] Home button released -> dismissing Lock Screen to Home Screen\n");
-		me->postHomeButtonEvent(0);
+		op2_home_button_post(0);
 		/* Wait 2500ms for unlock transition to complete and Home Screen icon grid to settle */
 		me->fTapStep = 7;
 		sender->setTimeoutMS(2500);
 		break;
 
 	case 7:
+		if (op2_autoinput_mode == 1) {
+			static bool sHandsOnLogged = false;
+			sHandsOnUnlocked = true;
+			if (!sHandsOnLogged) {
+				sHandsOnLogged = true;
+				IOLog("OP2 Digitizer: === HANDS-ON MODE: Home Screen unlocked! User in full control ===\n");
+			}
+			/* If the display was turned off, wake it with the Home key */
+			if (op2_fb_is_power_off()) {
+				IOLog("OP2 Digitizer: display off, waking SpringBoard with Home key\n");
+				op2_home_button_post(1);
+				me->fTapStep = 18;
+				sender->setTimeoutMS(3000);
+				break;
+			}
+			/* Send a synthetic micro-event every 2.5s so iOS idle timer never triggers sleep */
+			me->postDigitizerEvent(1, 0x8000, 0x8000, 0, true);
+			me->fTapStep = 21;
+			sender->setTimeoutMS(40);
+			break;
+		}
 		/*
 		 * Phase 3: Home Screen Icon Grid Navigation!
 		 * Swipe horizontally left from right edge to center (x=0.80 -> x=0.20) to transition pages.
@@ -762,45 +785,66 @@ OP2Digitizer::tapTimerFired(OSObject *owner, IOTimerEventSource *sender)
 			s_last_tracked_shown = cur_shown;
 		}
 
-		/* Pure micro-tap keepalive (keeps display awake without button triggers) */
+		/* Periodic Home unlock retry if device is still on Lock Screen (shown >= 2) */
+		static uint32_t s_unlock_pulse_cycle = 0;
+		s_unlock_pulse_cycle++;
+		if ((s_unlock_pulse_cycle % 4) == 0 && cur_shown >= 2) {
+			IOLog("OP2 Digitizer: keepalive unlock pulse (cycle %u), pressing Home...\n", s_unlock_pulse_cycle);
+			op2_home_button_post(1);
+			me->fTapStep = 18;
+			sender->setTimeoutMS(120);
+			break;
+		}
+
+		/* Safe screen keepalive tap (away from edge bezels so iOS doesn't reject as palm) */
 		uint32_t n = ++op2_autotap_count;
 		if ((n % 40) == 0) {
-			IOLog("OP2 Digitizer: micro-tap keepalive active (tick %u)\n", n);
+			IOLog("OP2 Digitizer: keepalive active (tick %u)\n", n);
 		}
-		me->postDigitizerEvent(1, 0x0100, 0x0100, 0, true);
+		me->postDigitizerEvent(1, 0x8000, 0x8000, 0, true);
 		me->fTapStep = 16;
 		sender->setTimeoutMS(50);
 		break;
 	}
 	case 16: {
-		me->postDigitizerEvent(0, 0x0100, 0x0100, 0, true);
+		me->postDigitizerEvent(0, 0x8000, 0x8000, 0, true);
 		me->fTapStep = 15;
 		sender->setTimeoutMS(2500); /* 2.5s interval keeps screen permanently awake! */
 		break;
 	}
 	case 17:
-		me->postHomeButtonEvent(0);
+		op2_home_button_post(0);
 		/* Wait 1200ms for wake, then pulse Home a second time to unlock if screen was locked */
 		me->fTapStep = 19;
 		sender->setTimeoutMS(1200);
 		break;
 
 	case 18:
-		me->postHomeButtonEvent(0);
-		me->fTapStep = 0;
-		sender->setTimeoutMS(1500);
+		op2_home_button_post(0);
+		if (op2_fb_get_last_shown() >= 2 && op2_fb_get_last_nz() >= 500) {
+			me->fTapStep = (op2_autoinput_mode == 1) ? (sHandsOnUnlocked ? 7 : 1) : 15;
+		} else {
+			me->fTapStep = 0;
+		}
+		sender->setTimeoutMS(2000);
 		break;
 
 	case 19:
 		IOLog("OP2 Digitizer: [HOME SCREEN] periodic Home unlock pulse\n");
-		me->postHomeButtonEvent(1);
+		op2_home_button_post(1);
 		me->fTapStep = 20;
 		sender->setTimeoutMS(120);
 		break;
 
 	case 20:
-		me->postHomeButtonEvent(0);
+		op2_home_button_post(0);
 		me->fTapStep = 15;
+		sender->setTimeoutMS(2500);
+		break;
+
+	case 21:
+		me->postDigitizerEvent(0, 0x8000, 0x8000, 0, true);
+		me->fTapStep = 7;
 		sender->setTimeoutMS(2500);
 		break;
 
@@ -975,6 +1019,15 @@ OP2DigitizerUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 		}
 		return kIOReturnSuccess;
 
+	case 100: /* kOP2DigitizerPostTouch (touchDown, x_fp16, y_fp16) */
+		if (arguments->scalarInputCount >= 3 && fOwner != NULL) {
+			fOwner->postDigitizerEvent((uint32_t)arguments->scalarInput[0],
+			                           (uint32_t)arguments->scalarInput[1],
+			                           (uint32_t)arguments->scalarInput[2]);
+			return kIOReturnSuccess;
+		}
+		return kIOReturnBadArgument;
+
 	default:
 		IOLog("OP2 Digitizer: %s method selector %u (inScalars %u, inStruct %lu)\n",
 		    name, selector, arguments->scalarInputCount, (unsigned long)arguments->structureInputSize);
@@ -1057,6 +1110,7 @@ OP2Buttons::start(IOService *provider)
 void
 OP2Buttons::stop(IOService *provider)
 {
+	IOLog("OP2 Buttons: service stop (gOP2Buttons cleared)\n");
 	gOP2Buttons = NULL;
 	IOHIDEventService::stop(provider);
 }
@@ -1078,7 +1132,10 @@ OP2Buttons::free(void)
 void
 OP2Buttons::key(uint32_t usage, uint32_t down)
 {
-	if (!fQueue) return;
+	if (!fQueue) {
+		IOLog("OP2 Buttons: key 0x%x dropped, no queue (service stopped?) down=%u\n", usage, down);
+		return;
+	}
 
 	IOHIDKeyboardPacket pkt;
 	bzero(&pkt, sizeof(pkt));
@@ -1250,6 +1307,13 @@ OP2ButtonsUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			    name, (unsigned long)sizeof(struct IOHIDElementStruct));
 		}
 		return kIOReturnSuccess;
+
+	case 100: /* kOP2ButtonsPostKey (usage, down) */
+		if (arguments->scalarInputCount >= 2 && fOwner != NULL) {
+			fOwner->key((uint32_t)arguments->scalarInput[0], (uint32_t)arguments->scalarInput[1]);
+			return kIOReturnSuccess;
+		}
+		return kIOReturnBadArgument;
 
 	default:
 		IOLog("OP2 Buttons: %s method selector %u (inScalars %u, inStruct %lu)\n",

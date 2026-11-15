@@ -91,8 +91,8 @@ enum {
 	kOP2SurfaceSetValues          = 9,
 	kOP2SurfaceCopyValues         = 10,
 	kOP2SurfaceLimits             = 13,
-	kOP2SurfaceLookupFromPort     = 34,
-	kOP2SurfaceCreatePort         = 35,
+	kOP2SurfaceLookupFromPort     = 33,
+	kOP2SurfaceCreatePort         = 34,
 };
 
 enum {
@@ -753,9 +753,11 @@ static void
 op2_surface_fill_result(OP2Surface *s, OP2SurfaceRef *ref, uint8_t *out)
 {
 	bzero(out, OP2_SURFACE_RESULT_SIZE);
-	put64(out, 0x00, ref->data->getAddress());
-	put64(out, 0x08, ref->state->getAddress());
-	put64(out, 0x10, ref->state->getAddress() + OP2_SURFACE_TIMESTAMPS);
+	uint64_t data_addr = (ref && ref->data) ? ref->data->getAddress() : 0;
+	uint64_t state_addr = (ref && ref->state) ? ref->state->getAddress() : 0;
+	put64(out, 0x00, data_addr);
+	put64(out, 0x08, state_addr);
+	put64(out, 0x10, state_addr ? state_addr + OP2_SURFACE_TIMESTAMPS : 0);
 	put32(out, 0x18, s->id);
 	put32(out, 0x1c, s->allocSize);
 	put32(out, 0x20, s->width);
@@ -1015,14 +1017,13 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		uint64_t carveout_phys = 0;
 
 		/*
-		 * MDP5 Direct Scanout Optimization:
-		 * Only allocate from carveout if the surface matches the panel scanout
-		 * dimensions (1080x1920) so MDP5 can scan it out directly without downsampling.
-		 * Surfaces that require downsampling (like SpringBoard's 1242x2208) use
-		 * normal cached system RAM (IOBufferMemoryDescriptor) for high-speed CPU
-		 * compositing and downsampling.
+		 * MDP5 Direct Scanout & Hardware Scaler Optimization:
+		 * Allocate from carveout if the surface matches the panel scanout
+		 * dimensions (1080x1920) or SpringBoard's Retina dimensions (1242x2208)
+		 * so MDP5 VIG0 hardware pipe can scan it out directly with hardware scaling.
 		 */
-		if (s->width == 1080 && s->height == 1920 && s->allocSize <= OP2_CARVEOUT_SLOT_SIZE) {
+		if (((s->width == 1080 && s->height == 1920) || (s->width == 1242 && s->height == 2208)) &&
+		    s->allocSize <= OP2_CARVEOUT_SLOT_SIZE) {
 			carveout_phys = op2_carveout_alloc_slot(s->allocSize);
 		}
 
@@ -1263,12 +1264,17 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kOP2SurfaceCopyValues:
 		return copyValues(args);
 	default:
-		/* Values, notifications, ownership, timestamps: accept and ignore. */
+		/*
+		 * If userland expects a structure output (e.g. an unhandled lookup
+		 * or create), do NOT pretend success with a zeroed buffer. Userland
+		 * would treat NULL pointers as valid and crash.
+		 */
+		if (args->structureOutput != NULL || args->structureOutputDescriptor != NULL) {
+			op2_surf_log_once("sel-unsupp", selector);
+			return kIOReturnUnsupported;
+		}
 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
 			args->scalarOutput[i] = 0;
-		}
-		if (args->structureOutput != NULL) {
-			bzero(args->structureOutput, args->structureOutputSize);
 		}
 		op2_surf_log_once("sel", selector);
 		return kIOReturnSuccess;

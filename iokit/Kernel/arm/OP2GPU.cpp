@@ -2894,7 +2894,10 @@ OP2GPUUserClient::externalMethod(uint32_t selector,
 
 	case kOP2Show: {
 		op2_fb_kick_panel_external();
-		IOLog("OP2 GPU Client: kOP2Show kicked display panel\n");
+		static uint32_t sShowLogged = 0;
+		if (++sShowLogged <= 3) {
+			IOLog("OP2 GPU Client: kOP2Show kicked display panel (#%u)\n", sShowLogged);
+		}
 		return kIOReturnSuccess;
 	}
 

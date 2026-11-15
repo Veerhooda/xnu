@@ -463,7 +463,7 @@ op2_usb_probe(void)
 static void
 op2_thermal_thread(__unused void *param, __unused wait_result_t wr)
 {
-	uint32_t hot = 70, crit = 90;   /* stock msm_thermal starts limiting the A53s at 60 C (sensor 7) */
+	uint32_t hot = 82, crit = 95;   /* A53 throttle at 82 C, recover at 78 C, hard safety cutoff at 95 C */
 	PE_parse_boot_argn("op2_thot", &hot, sizeof(hot));
 	PE_parse_boot_argn("op2_tcrit", &crit, sizeof(crit));
 	op2_tsens = (volatile uint32_t *)ml_io_map(0xfc4a8000, 0x2000);
@@ -501,7 +501,7 @@ op2_thermal_thread(__unused void *param, __unused wait_result_t wr)
 				op2_temp_throttled = 1;
 				int mhz = op2_cpu_set_throttle(1);
 				printf("OP2 THERM: %d C >= %u: CPU throttled to ~%d MHz\n", mx, hot, mhz);
-			} else if (op2_temp_throttled && mx <= (int)hot - 10) {   /* 60 C with the default */
+			} else if (op2_temp_throttled && mx <= (int)hot - 4) {   /* 74 C with the default: allows recovery under passive cooling */
 				op2_temp_throttled = 0;
 				int mhz = op2_cpu_set_throttle(0);
 				printf("OP2 THERM: %d C: CPU back to ~%d MHz\n", mx, mhz);

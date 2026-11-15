@@ -26,6 +26,8 @@
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" void op2_digitizer_post(uint32_t touchDown, uint32_t x_fp16, uint32_t y_fp16, uint32_t z_raw);
 extern "C" void op2_home_button_post(uint32_t down);
+extern "C" bool op2_fb_is_power_off(void);
+extern "C" uint64_t op2_fb_get_last_kick(void);
 
 /* Physical bases (MSM8994) */
 #define OP2_QUP2_PHYS           0xf9924000ULL
@@ -377,8 +379,8 @@ OP2I2C::pollLoop(void)
 {
 	bool prevDown = false;
 	bool homeTouch = false;
-	/* 1850 (was 1880): round fable-30, several Home attempts started at y 1847..1869 and were taps instead */
-	uint32_t kHomeStripY = 1850;
+	/* 1720: comfortable virtual Home strip along the bottom edge of the display glass */
+	uint32_t kHomeStripY = 1720;
 	PE_parse_boot_argn("op2_homey", &kHomeStripY, sizeof(kHomeStripY));
 	/* op2hs=0 (Home strip): no virtual Home key, every touch goes to iOS. For the iPhone X gesture navigation
 	 * (MobileGestalt HomeButtonType 2): SpringBoard's own home gesture wants the swipe from the bottom edge. */
@@ -393,6 +395,19 @@ OP2I2C::pollLoop(void)
 	for (;;) {
 		IOSleep(20);
 		polls++;
+
+		/* Check Physical Chin Ceramic Home Button (GPIO 90, active HIGH) */
+		if (fTlmm != NULL) {
+			static bool prevFpcDown = false;
+			uint32_t fpcVal = rd(fTlmm, OP2_TLMM_INOUT(90)) & 1;
+			bool fpcDown = (fpcVal != 0);
+			if (fpcDown != prevFpcDown) {
+				op2_home_button_post(fpcDown ? 1 : 0);
+				IOLog("OP2I2C: Hardware Chin Home Button %s (GPIO 90 = %u)\n",
+				    fpcDown ? "DOWN" : "UP  ", fpcVal);
+				prevFpcDown = fpcDown;
+			}
+		}
 
 		uint8_t w[2];
 		if (synaRead(kSynaF01Data, w, 2) != 0) {
@@ -457,7 +472,14 @@ OP2I2C::pollLoop(void)
 			 * Home. Old code: any y>1820 was BOTH a tap and a Home press.
 			 */
 			if (down && !prevDown) {
-				homeTouch = homeStrip && (py >= kHomeStripY && px > 250 && px < 830);
+				uint64_t lk = op2_fb_get_last_kick();
+				bool is_idle = op2_fb_is_power_off() || (lk != 0 && (mach_absolute_time() - lk > 38400000ULL));
+				if (is_idle) {
+					homeTouch = true;
+					IOLog("OP2I2C: tap-to-wake: screen is idle (no kicks for >2s), waking with Home key\n");
+				} else {
+					homeTouch = homeStrip && (py >= kHomeStripY);
+				}
 			}
 			if (homeTouch) {
 				if (down != prevDown) {
@@ -585,6 +607,23 @@ OP2I2C::start(IOService *provider)
 	IOLog("OP2I2C: gpio74 1v8 CFG %08x->%08x IO %08x->%08x; reset31 CFG=%08x IO=%08x; ATTN now=%u\n",
 	    c74, rd(fTlmm, OP2_TLMM_CFG(74)), io74, rd(fTlmm, OP2_TLMM_INOUT(74)),
 	    rd(fTlmm, OP2_TLMM_CFG(31)), rd(fTlmm, OP2_TLMM_INOUT(31)), attn2);
+
+	/* Hardware Chin Home Button (FPC1150 fingerprint sensor):
+	 * GPIO 41: 1.8V power rail enable -> output HIGH
+	 * GPIO 89: sensor reset -> output HIGH
+	 * GPIO 90: touch IRQ -> input */
+	uint32_t c41 = rd(fTlmm, OP2_TLMM_CFG(41));
+	wr(fTlmm, OP2_TLMM_CFG(41), c41 | (1U << 9)); /* DIR=output */
+	wr(fTlmm, OP2_TLMM_INOUT(41), rd(fTlmm, OP2_TLMM_INOUT(41)) | (1U << 1)); /* OUT=1 */
+
+	uint32_t c89 = rd(fTlmm, OP2_TLMM_CFG(89));
+	wr(fTlmm, OP2_TLMM_CFG(89), c89 | (1U << 9)); /* DIR=output */
+	wr(fTlmm, OP2_TLMM_INOUT(89), rd(fTlmm, OP2_TLMM_INOUT(89)) | (1U << 1)); /* OUT=1 */
+
+	uint32_t c90 = rd(fTlmm, OP2_TLMM_CFG(90));
+	wr(fTlmm, OP2_TLMM_CFG(90), c90 & ~(1U << 9)); /* DIR=input */
+	IOLog("OP2I2C: Chin Home Button (GPIO 90) initialized: CFG=%08x IO=%08x\n",
+	    rd(fTlmm, OP2_TLMM_CFG(90)), rd(fTlmm, OP2_TLMM_INOUT(90)));
 
 	/* I2C pins 6/7: keep aboot's proven-good CFG (0x2cc: func3, 8mA).
 	 * Do NOT rewrite drive strength: TWRP touch works with this value. */

@@ -647,7 +647,8 @@ workq_thread_allocsize(proc_t p, vm_map_t wq_map,
 			pthread_kern->proc_get_pthsize(p) + PTHREAD_T_OFFSET,
 			vm_map_page_mask(wq_map));
 	if (guardsize_out) *guardsize_out = guardsize;
-	return guardsize + PTH_DEFAULT_STACKSIZE + pthread_size;
+	/* Add 2 map pages headroom above stack/pthread to protect chunked loads from faulting on boundary */
+	return guardsize + PTH_DEFAULT_STACKSIZE + pthread_size + 2 * vm_map_page_size(wq_map);
 }
 
 int
@@ -658,7 +659,7 @@ workq_create_threadstack(proc_t p, vm_map_t vmap, mach_vm_offset_t *out_addr)
 	kern_return_t kret;
 
 	th_allocsize = workq_thread_allocsize(p, vmap, &guardsize);
-	kret = mach_vm_map(vmap, &stackaddr, th_allocsize, page_size - 1,
+	kret = mach_vm_map(vmap, &stackaddr, th_allocsize, vm_map_page_mask(vmap),
 			VM_MAKE_TAG(VM_MEMORY_STACK) | VM_FLAGS_ANYWHERE, NULL, 0, FALSE,
 			VM_PROT_DEFAULT, VM_PROT_ALL, VM_INHERIT_DEFAULT);
 
@@ -842,7 +843,7 @@ workq_kevent(proc_t p, struct workq_thread_addrs *th_addrs, int upcall_flags,
 {
 	bool workloop = upcall_flags & WQ_FLAG_THREAD_WORKLOOP;
 	int kevent_count = WQ_KEVENT_LIST_LEN;
-	user_addr_t kevent_list = th_addrs->self - WQ_KEVENT_LIST_LEN * sizeof(struct kevent_qos_s);
+	user_addr_t kevent_list = th_addrs->self - 64 - WQ_KEVENT_LIST_LEN * sizeof(struct kevent_qos_s);
 	user_addr_t kevent_id_addr = kevent_list;
 	kqueue_id_t kevent_id = -1;
 	int ret;
@@ -874,7 +875,7 @@ workq_kevent(proc_t p, struct workq_thread_addrs *th_addrs, int upcall_flags,
 	}
 
 	// squash any errors into just empty output
-	if (ret != 0 || kevent_count == -1) {
+	if (ret != 0 || kevent_count <= 0) {
 		*kevent_list_out = 0;
 		*kevent_count_out = 0;
 		return ret;
@@ -938,18 +939,21 @@ workq_setup_thread(proc_t p, thread_t th, vm_map_t map, user_addr_t stackaddr,
 			}
 		}
 
-		/*
-		 * Pre-fault the first page of the new thread's stack and the page that will
-		 * contain the pthread_t structure.
-		 */
-		vm_map_offset_t mask = vm_map_page_mask(map);
-		vm_map_offset_t th_page = vm_map_trunc_page_mask(th_addrs.self, mask);
-		vm_map_offset_t stk_page = vm_map_trunc_page_mask(th_addrs.stack_top - 1, mask);
-		if (th_page != stk_page) {
-			vm_fault(map, stk_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
-		}
-		vm_fault(map, th_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
 	}
+
+	/*
+	 * Pre-fault the thread's stack pages, the page containing pthread_t,
+	 * and the headroom page to prevent chunked vector loads (ldnp) from
+	 * triggering KERN_MEMORY_ERROR/SIGBUS at page boundaries.
+	 */
+	vm_map_offset_t mask = vm_map_page_mask(map);
+	vm_map_offset_t th_page = vm_map_trunc_page_mask(th_addrs.self, mask);
+	vm_map_offset_t stk_page = vm_map_trunc_page_mask(th_addrs.stack_top - 1, mask);
+	if (th_page != stk_page) {
+		vm_fault(map, stk_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
+	}
+	vm_fault(map, th_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
+	vm_fault(map, th_page + vm_map_page_size(map), VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
 
 	if (setup_flags & WQ_SETUP_EXIT_THREAD) {
 		kevent_count = WORKQ_EXIT_THREAD_NKEVENT;
@@ -993,6 +997,15 @@ workq_handle_stack_events(proc_t p, thread_t th, vm_map_t map,
 
 	kr = pthread_kern->thread_set_voucher_name(MACH_PORT_NULL);
 	assert(kr == KERN_SUCCESS);
+
+	vm_map_offset_t mask = vm_map_page_mask(map);
+	vm_map_offset_t th_page = vm_map_trunc_page_mask(th_addrs.self, mask);
+	vm_map_offset_t stk_page = vm_map_trunc_page_mask(th_addrs.stack_top - 1, mask);
+	if (th_page != stk_page) {
+		vm_fault(map, stk_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
+	}
+	vm_fault(map, th_page, VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
+	vm_fault(map, th_page + vm_map_page_size(map), VM_PROT_READ | VM_PROT_WRITE, FALSE, THREAD_UNINT, NULL, 0);
 
 	workq_set_register_state(p, th, &th_addrs, kport,
 			kevent_list, upcall_flags, kevent_count);

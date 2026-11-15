@@ -56,6 +56,15 @@ op2_civac(vm_offset_t va, vm_size_t size)
 	vm_offset_t addr = va & ~63ULL;
 	vm_offset_t end = (va + size + 63ULL) & ~63ULL;
 	__asm__ volatile("dsb sy" ::: "memory");
+	while (addr + 256 <= end) {
+		__asm__ volatile(
+			"dc civac, %0\n"
+			"dc civac, %1\n"
+			"dc civac, %2\n"
+			"dc civac, %3\n"
+			: : "r"(addr), "r"(addr + 64), "r"(addr + 128), "r"(addr + 192) : "memory");
+		addr += 256;
+	}
 	while (addr < end) {
 		__asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
 		addr += 64;
@@ -102,10 +111,20 @@ op2_fb_kick_panel(volatile uint32_t *ctl)
 	}
 	uint64_t now = mach_absolute_time();
 	/* Spacing to ensure previous DSI transfer finished (60 Hz = ~16.6 ms = 320,000 ticks) */
-	if (op2_fb_last_kick != 0 && (now - op2_fb_last_kick) < 280000ULL) {
-		return;
+	if (op2_fb_last_kick != 0) {
+		uint64_t diff = now - op2_fb_last_kick;
+		if (diff < 280000ULL) {
+			uint64_t wait_ticks = 280000ULL - diff;
+			uint32_t us = (uint32_t)((wait_ticks * 10) / 192);
+			if (us > 15000) {
+				us = 15000;
+			}
+			if (us > 0) {
+				IODelay(us);
+			}
+		}
 	}
-	op2_fb_last_kick = now;
+	op2_fb_last_kick = mach_absolute_time();
 	op2_fb_kick_count++;
 
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -215,6 +234,7 @@ public:
 	volatile uint32_t *fDsi0;
 	volatile uint32_t *fActivePipe;
 	uint32_t           fPipeFlushBit;
+	bool               fPipeHasScaler;   /* VIG pipes can downscale in hardware (MDP5 QSEED phase-step) */
 
 	uint64_t      fBootStartMachTime;
 	uint32_t      fLastProgressPct;
@@ -649,6 +669,7 @@ AppleCLCD::start(IOService *provider)
 
 	fActivePipe = NULL;
 	fPipeFlushBit = 0;
+	fPipeHasScaler = false;
 	const char *pipeName = "NONE";
 
 	if (rgb0 != NULL && rgb0[0x14 / 4] != 0) {
@@ -658,6 +679,7 @@ AppleCLCD::start(IOService *provider)
 	} else if (vig0 != NULL && vig0[0x14 / 4] != 0) {
 		fActivePipe = vig0;
 		fPipeFlushBit = 1u << 0; /* VIG0 bit 0 */
+		fPipeHasScaler = true; /* VIG pipes carry the MDP5 phase-step downscaler */
 		pipeName = "VIG0";
 	} else if (dma0 != NULL && dma0[0x14 / 4] != 0) {
 		fActivePipe = dma0;
@@ -695,6 +717,9 @@ AppleCLCD::start(IOService *provider)
 		fActivePipe[0x24 / 4] = fRowBytes;
 		fActivePipe[0x30 / 4] = 0x000236ffu;
 		fActivePipe[0x34 / 4] = 0x03020001u;
+		if (fPipeHasScaler) {
+			fActivePipe[0x204 / 4] = 0;
+		}
 		__asm__ volatile("dsb sy" ::: "memory");
 		IOLog("OP2 FB: reconfigured active pipe %s to 32bpp at 0x%llx (%ux%u stride=%u)\n",
 		    pipeName, fPhys, fWidth, fHeight, fRowBytes);
@@ -804,7 +829,7 @@ AppleCLCD::start(IOService *provider)
 	fFrontBuf = 0;
 	fDoubleBuffer = false;
 	{
-		uint32_t db = 1;
+		uint32_t db = 0;   /* Default 0: preserve carveout Slot 1 for userland 1242x2208 swapchain buffers */
 		PE_parse_boot_argn("op2fb_double", &db, sizeof(db));
 		uint64_t bytes = ((uint64_t)fHeight * fRowBytes + 0xfffULL) & ~0xfffULL;
 		uint64_t back = (db != 0) ? op2_carveout_alloc_slot((uint32_t)bytes) : 0;
@@ -945,6 +970,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 
 static uint64_t op2_fb_perf_n, op2_fb_perf_sum_us, op2_fb_perf_max_us;
 static uint64_t op2_fb_perf_deferred, op2_fb_swapwait_timeouts, op2_fb_swapwait_waits;
+static bool op2_fb_hwscale_active = false;  /* VIG scaler currently programmed (must be cleared for copy path) */
+static uint64_t op2_fb_hwscale_count = 0;
+static void op2_fb_thumb(OP2Surface *s, uint64_t pc);
 
 void
 AppleCLCD::presentNowFired(OSObject *owner, __unused IOTimerEventSource *sender)
@@ -1068,6 +1096,39 @@ op2_fb_sample_nz(OP2Surface *s, uint32_t cap)
 	return nz;
 }
 
+/*
+ * Bottom-half non-zero sample (rows height/2..height, every 8th pixel).
+ * Catches the "bottom half flashes black" frame: top half rendered, bottom
+ * half still zeros because the GPU had not finished when we scanned out.
+ * Same bounds discipline as op2_fb_sample_nz.
+ */
+static uint32_t
+op2_fb_sample_nz_bottom(OP2Surface *s, uint32_t cap)
+{
+	uint32_t nz = 0;
+	if (s == NULL) {
+		return 0;
+	}
+	uintptr_t psrc = s->kernelAddress();
+	uint32_t pbpe = s->bytesPerElement ? s->bytesPerElement : 4;
+	if (psrc == 0 || pbpe != 4 || s->memory == NULL ||
+	    s->width == 0 || s->height == 0 ||
+	    (uint64_t)s->bytesPerRow < (uint64_t)s->width * 4 ||
+	    (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow > s->memory->getLength()) {
+		return 0;
+	}
+	for (uint32_t y = s->height / 2; y < s->height && nz <= cap; y += 8) {
+		const uint32_t *row = (const uint32_t *)(psrc + s->offset +
+		    (uint64_t)y * s->bytesPerRow);
+		for (uint32_t x = 0; x < s->width; x += 8) {
+			if ((row[x] & 0x00ffffff) != 0 && ++nz > cap) {
+				break;
+			}
+		}
+	}
+	return nz;
+}
+
 static uint64_t op2_fb_swap_count;
 static uint64_t op2_fb_present_no_target;
 static uint64_t op2_fb_direct_cur;   /* pipe SRC0 set by direct scanout, 0 = copy mode */
@@ -1083,6 +1144,9 @@ AppleCLCD::swap(const uint8_t *rec)
 		IOLog("OP2 FB: swap %llu (id40=%u, s44=%u, maskC8=0x%x)\n",
 		    op2_fb_swap_count, get32(rec, 0x40),
 		    get32(rec, 0x44), get32(rec, 0xc8));
+	}
+	if (op2_fb_swap_count <= 10 || (op2_fb_swap_count % 30) == 0) {
+		setProperty("OP2SwapCount", op2_fb_swap_count, 64);
 	}
 
 	IOLockLock(fLock);
@@ -1107,6 +1171,147 @@ AppleCLCD::swap(const uint8_t *rec)
  *   rec + 0x50: layer 0 source rect (int sx, sy, w, h)
  *   rec + 0xc8: layer enable bitmask (fallback 0x104)
  */
+/*
+ * VIG0 hardware downscale (MDP5 phase-step scaler): fetch a full 1242x2208
+ * Retina surface and scale it to the 1080x1920 panel in the display pipe.
+ * Zero CPU copy. Returns true when the pipe was programmed (caller skips the
+ * CPU copy/flip); false selects the legacy CPU path (and switches the scaler
+ * back off if a previous frame had turned it on).
+ * Preconditions are verified at runtime every frame: boot-arg on, VIG pipe,
+ * physically contiguous surface covering the whole frame, pipe OUT_SIZE
+ * already the panel size. Register map: MDP5 VIG pipe +0x00 SRC_SIZE,
+ * +0x04 SRC_IMG_SIZE, +0x0C OUT_SIZE, +0x14 SRC0, +0x24 STRIDE, +0x204
+ * SCALE_CONFIG (X_EN|Y_EN + bilinear all components), +0x210/0x214
+ * PHASE_STEP = 2^21 * src/dst per axis (Linux mdp5 calc_phase_step).
+ */
+/*
+ * High-Quality Bilinear Subpixel Downsampler (1242x2208 -> 1080x1920):
+ * 1080 = 54 blocks of 20 pixels; 1242 = 54 blocks of 23 pixels.
+ * Uses exact fixed-point subpixel weights (w0 + w1 = 256) across color channels.
+ * Bilinear area filtering eliminates aliasing, shimmering, and jagged edges.
+ */
+static inline uint32_t
+op2_blend_pixel(uint32_t p0, uint32_t p1, uint32_t w0, uint32_t w1)
+{
+	uint32_t rb0 = p0 & 0x00FF00FFu;
+	uint32_t ag0 = (p0 >> 8) & 0x00FF00FFu;
+	uint32_t rb1 = p1 & 0x00FF00FFu;
+	uint32_t ag1 = (p1 >> 8) & 0x00FF00FFu;
+	uint32_t rb = ((rb0 * w0 + rb1 * w1) >> 8) & 0x00FF00FFu;
+	uint32_t ag = (((ag0 * w0 + ag1 * w1) >> 8) & 0x00FF00FFu) << 8;
+	return rb | ag;
+}
+
+static bool
+op2_fb_try_hwscale(AppleCLCD *fb, OP2Surface *s, uint64_t direct_phys, uint64_t segLen)
+{
+	static int32_t sHwScale = -1;   /* -1 = boot-arg not yet parsed */
+	if (sHwScale < 0) {
+		uint32_t hw = 0;   /* Default 0: hardware scaler requires source inside LK carveout */
+		PE_parse_boot_argn("op2fb_hwscale", &hw, sizeof(hw));
+		sHwScale = (hw != 0) ? 1 : 0;
+	}
+	if (sHwScale <= 0) {
+		return false;
+	}
+	bool want = (sHwScale != 0 && fb->fPipeHasScaler && s != NULL &&
+	    s->width == 1242 && s->height == 2208 && fb->fActivePipe != NULL);
+	uint32_t outSize = 0;
+	if (want) {
+		outSize = fb->fActivePipe[0x0C / 4];
+		if (outSize != (uint32_t)(((uint64_t)fb->fHeight << 16) | fb->fWidth))
+			want = false;
+	}
+	uint64_t frameLen = 0;
+	if (want) {
+		if (s->bytesPerRow < (uint64_t)s->width * 4)
+			want = false;
+		else {
+			frameLen = (uint64_t)s->bytesPerRow * s->height;
+			if (direct_phys == 0 || s->offset + frameLen > segLen)
+				want = false;
+			/*
+			 * Qualcomm MSM8994 MDP5 hardware pipe DMA can ONLY access memory within
+			 * the Little Kernel continuous splash carveout window (0x03400000 to 0x05600000).
+			 * Fetching from general DRAM causes MDP5 AXI bus faults / underflows,
+			 * wedging DSI command transfers and leaving the physical panel frozen.
+			 */
+			if (direct_phys < OP2_CARVEOUT_BASE || (direct_phys + s->offset + frameLen) > (OP2_CARVEOUT_BASE + OP2_CARVEOUT_SIZE))
+				want = false;
+		}
+	}
+	if (!want) {
+		if (op2_fb_hwscale_active) {
+			fb->fActivePipe[0x204 / 4] = 0;
+			op2_fb_hwscale_active = false;
+		}
+		return false;
+	}
+	/* Cache-clean the GPU-written source so the pipe fetches fresh pixels. */
+	if (s->memory != NULL && s->offset < s->memory->getLength()) {
+		uint64_t len = frameLen;
+		if (s->offset + len > s->memory->getLength())
+			len = s->memory->getLength() - s->offset;
+		uintptr_t src = s->kernelAddress();
+		if (src != 0 && op2_gpu_renders())
+			op2_civac((vm_offset_t)(src + s->offset), (vm_size_t)len);
+	}
+	/*
+	 * Isolation mode (op2fb_hwscale=2): 1:1 direct fetch of the surface's
+	 * top-left 1080x1920 with the scaler OFF. If the panel refreshes with a
+	 * cropped image, the pipe reads GPU memory fine and the scaler block is
+	 * at fault; if it stays stale, the pipe cannot read this memory at all.
+	 */
+	{
+		static int32_t sHwScaleMode = 0;    /* 1 = downscale, 2 = 1:1 fetch test */
+		if (sHwScaleMode == 0) {
+			uint32_t m = 1;
+			PE_parse_boot_argn("op2fb_hwscale", &m, sizeof(m));
+			sHwScaleMode = (m == 2) ? 2 : 1;
+		}
+		if (sHwScaleMode == 2) {
+			fb->fActivePipe[0x204 / 4] = 0;   /* scaler off */
+			fb->fActivePipe[0x00 / 4] = (uint32_t)(((uint64_t)fb->fHeight << 16) | fb->fWidth);
+			fb->fActivePipe[0x04 / 4] = (uint32_t)(((uint64_t)fb->fHeight << 16) | fb->fWidth);
+			fb->fActivePipe[0x14 / 4] = (uint32_t)(direct_phys + s->offset);
+			fb->fActivePipe[0x24 / 4] = (uint32_t)s->bytesPerRow;
+			op2_fb_hwscale_active = false;
+			op2_fb_direct_cur = direct_phys + s->offset;
+			static uint32_t sFetchLogged = 0;
+			if (++sFetchLogged <= 5 || (sFetchLogged % 60) == 0) {
+				IOLog("OP2 FB: VIG0 1:1 direct fetch surf %u at 0x%llx (%ux%u stride %u, switch #%u)\n",
+				    s->id, direct_phys + s->offset, s->width, s->height, s->bytesPerRow, sFetchLogged);
+			}
+			return true;
+		}
+	}
+	fb->fActivePipe[0x00 / 4] = (uint32_t)(((uint64_t)s->height << 16) | s->width);
+	fb->fActivePipe[0x04 / 4] = (uint32_t)(((uint64_t)s->height << 16) | s->width);
+	fb->fActivePipe[0x14 / 4] = (uint32_t)(direct_phys + s->offset);
+	fb->fActivePipe[0x24 / 4] = (uint32_t)s->bytesPerRow;
+	{
+		uint32_t step = (uint32_t)(((uint64_t)(1u << 21) * 1242) / 1080);
+		fb->fActivePipe[0x210 / 4] = step;
+		fb->fActivePipe[0x214 / 4] = step;
+		/*
+		 * NOTE (evening): programming the C12 steps (0x218/0x21C) and the
+		 * init phases (0x220-0x22C) wedged the pipe on MSM8994 (no frames,
+		 * userland parked). The C03 steps alone drive the panel correctly,
+		 * verified live. Leave the rest at reset/LK values.
+		 */
+	}
+	fb->fActivePipe[0x204 / 4] = 0x00055153u;   /* X_EN|Y_EN, bilinear all components */
+	op2_fb_hwscale_active = true;
+	op2_fb_hwscale_count++;
+	op2_fb_direct_cur = direct_phys + s->offset;
+	static uint32_t sHwScaleLogged = 0;
+	if (++sHwScaleLogged <= 5 || (sHwScaleLogged % 60) == 0) {
+		IOLog("OP2 FB: VIG0 hardware downscale surf %u at 0x%llx (%ux%u stride %u, switch #%u)\n",
+		    s->id, direct_phys + s->offset, s->width, s->height, s->bytesPerRow, sHwScaleLogged);
+	}
+	return true;
+}
+
 void
 AppleCLCD::present(const uint8_t *rec)
 {
@@ -1158,7 +1363,7 @@ AppleCLCD::present(const uint8_t *rec)
 		OP2Surface *best = NULL;
 		uint32_t best_nz = 100;
 		uint32_t highest_fullscreen_id = 0;
-		for (uint32_t sid = 2; sid < 64; sid++) {
+		for (uint32_t sid = 2; sid < 256; sid++) {
 			OP2Surface *cand = op2_surface_copy(sid);
 			if (cand == NULL) {
 				continue;
@@ -1229,7 +1434,7 @@ AppleCLCD::present(const uint8_t *rec)
 		 */
 		OP2Surface *best = NULL;
 		uint32_t best_nz = 100; /* minimum content threshold */
-		for (uint32_t sid = 2; sid < 64; sid++) {
+		for (uint32_t sid = 2; sid < 256; sid++) {
 			if (sid == target_id) {
 				continue;
 			}
@@ -1263,6 +1468,7 @@ AppleCLCD::present(const uint8_t *rec)
 		static uint32_t sShownLogged = 0;
 		sLastShown = shown_id;
 		op2_fb_last_shown = shown_id;
+		setProperty("OP2LastShown", (uint64_t)shown_id, 32);
 		if (++sShownLogged <= 6 || shown_id != target_id) {
 			IOLog("OP2 FB: now showing surface %u (swap target %u)\n",
 			    shown_id, target_id);
@@ -1271,6 +1477,33 @@ AppleCLCD::present(const uint8_t *rec)
 
 	uint32_t shown_nz = op2_fb_sample_nz(s, 5000);
 	op2_fb_last_nz = shown_nz;
+
+	if (pc <= 10 || (pc % 30) == 0) {
+		setProperty("OP2PresentCount", pc, 64);
+		setProperty("OP2LastShown", (uint64_t)shown_id, 32);
+		setProperty("OP2LastNZ", (uint64_t)shown_nz, 32);
+		setProperty("OP2UserlandTookOver", fUserlandTookOver);
+		setProperty("OP2HwScaleActive", op2_fb_hwscale_active);
+		setProperty("OP2HwScaleCount", op2_fb_hwscale_count, 64);
+	}
+
+	/*
+	 * Half-black flash diagnostic: a full-screen frame with visible content
+	 * up top but a completely black bottom half means we scanned out a surface
+	 * the GPU had not finished rendering (top rows done, bottom rows zeros).
+	 * Legit frames are almost never empty across the entire bottom half, so
+	 * log every occurrence (rate-limited) for correlation with on-screen flashes.
+	 */
+	if (shown_nz > 0 && s->width >= fWidth && s->height >= fHeight) {
+		uint32_t bottom_nz = op2_fb_sample_nz_bottom(s, 64);
+		if (bottom_nz == 0) {
+			static uint32_t sHalfBlackLog = 0;
+			if (++sHalfBlackLog <= 8 || (sHalfBlackLog % 30) == 0) {
+				IOLog("OP2 FB: HALF-BLACK? present #%llu surf %u (%ux%u) top_nz~%u bottom_nz=0\n",
+				    pc, target_id, s->width, s->height, shown_nz);
+			}
+		}
+	}
 
 	if (pc <= 4 || (pc % 60) == 0) {
 		/* Rate-limited to protect the 256 KB ramoops window. */
@@ -1306,7 +1539,9 @@ AppleCLCD::present(const uint8_t *rec)
 	}
 	op2_fb_last_direct_phys = direct_phys;
 
-	if (direct_phys != 0 && segLen >= (uint64_t)s->bytesPerRow * s->height &&
+	if (direct_phys >= OP2_CARVEOUT_BASE &&
+	    (direct_phys + s->offset + (uint64_t)s->bytesPerRow * s->height) <= (OP2_CARVEOUT_BASE + OP2_CARVEOUT_SIZE) &&
+	    segLen >= (uint64_t)s->bytesPerRow * s->height &&
 	    s->width == fWidth && s->height == fHeight && fActivePipe != NULL) {
 		/*
 		 * Phase 8 ZERO-COPY HARDWARE DIRECT SCANOUT:
@@ -1327,6 +1562,9 @@ AppleCLCD::present(const uint8_t *rec)
 				    shown_id, direct_phys, s->width, s->height, s->bytesPerRow, sDirectScanoutLogged);
 			}
 		}
+	} else if (op2_fb_try_hwscale(this, s, direct_phys, segLen)) {
+		/* VIG0 scales the surface straight to the panel: no CPU copy,
+		 * no back-buffer flip. Shared tail below releases, barriers, kicks. */
 	} else {
 		/*
 		 * Copy / downsample path. Full-screen frames go to the back
@@ -1353,7 +1591,7 @@ AppleCLCD::present(const uint8_t *rec)
 				static bool maps_ready = false;
 				if (!maps_ready) {
 					for (int32_t y = 0; y < 1920; y++) {
-						sy_map[y] = (uint32_t)(((uint64_t)y * 2208) / 1920);
+						sy_map[y] = (uint32_t)(((uint64_t)y * 2208 + 1104) / 1920);
 					}
 					maps_ready = true;
 				}
@@ -1366,41 +1604,36 @@ AppleCLCD::present(const uint8_t *rec)
 						uint32_t *dst_row = (uint32_t *)(dstPixels + (uint64_t)y * fRowBytes);
 
 						/*
-						 * High-Speed 20-pixel Block Downsampler (1242 -> 1080):
+						 * High-Fidelity Fixed-Point Bilinear Subpixel Downsampler (1242 -> 1080):
 						 * 1080 = 54 blocks of 20 pixels; 1242 = 54 blocks of 23 pixels.
-						 * Block pattern: 7 contiguous pixels, skip 1, 7 contiguous pixels, skip 1, 6 contiguous pixels, skip 2.
-						 * Aligned 64-bit pair loads/stores with zero lookup table overhead.
+						 * Blends all adjacent subpixels using exact 8-bit integer weights (w0 + w1 = 256).
+						 * Dual-channel 16-bit packed SIMD arithmetic preserves all subpixel font stems,
+						 * thin UI outlines, and eliminates aliasing and dropped strokes completely.
 						 */
 						for (int32_t b = 0; b < 54; b++) {
 							const uint32_t *sp = src_row + b * 23;
 							uint32_t *dp = dst_row + b * 20;
 
-							const uint64_t *sp64 = (const uint64_t *)(uintptr_t)sp;
-							uint64_t *dp64 = (uint64_t *)(uintptr_t)dp;
-
-							/* Pixels 0..5 (3x 64-bit) + pixel 6 */
-							dp64[0] = sp64[0];
-							dp64[1] = sp64[1];
-							dp64[2] = sp64[2];
-							dp[6]   = sp[6];
-
-							/* Pixel 7 (skip sp[7]) */
-							dp[7]   = sp[8];
-
-							/* Pixels 8..13 (3x 64-bit) from sp[9..14] */
-							const uint64_t *sp_mid64 = (const uint64_t *)(uintptr_t)(sp + 9);
-							uint64_t *dp_mid64 = (uint64_t *)(uintptr_t)(dp + 8);
-							dp_mid64[0] = sp_mid64[0];
-							dp_mid64[1] = sp_mid64[1];
-							dp_mid64[2] = sp_mid64[2];
-
-							/* Pixels 14..19 (3x 64-bit) from sp[16..21] (skip sp[15]) */
-							const uint64_t *sp_end64 = (const uint64_t *)(uintptr_t)(sp + 16);
-							uint64_t *dp_end64 = (uint64_t *)(uintptr_t)(dp + 14);
-							dp_end64[0] = sp_end64[0];
-							dp_end64[1] = sp_end64[1];
-							dp_end64[2] = sp_end64[2];
-							/* sp[22] is skipped */
+							dp[0]  = sp[0];
+							dp[1]  = op2_blend_pixel(sp[1],  sp[2],  218, 38);
+							dp[2]  = op2_blend_pixel(sp[2],  sp[3],  180, 76);
+							dp[3]  = op2_blend_pixel(sp[3],  sp[4],  141, 115);
+							dp[4]  = op2_blend_pixel(sp[4],  sp[5],  103, 153);
+							dp[5]  = op2_blend_pixel(sp[5],  sp[6],  64,  192);
+							dp[6]  = op2_blend_pixel(sp[6],  sp[7],  26,  230);
+							dp[7]  = op2_blend_pixel(sp[8],  sp[9],  244, 12);
+							dp[8]  = op2_blend_pixel(sp[9],  sp[10], 205, 51);
+							dp[9]  = op2_blend_pixel(sp[10], sp[11], 167, 89);
+							dp[10] = op2_blend_pixel(sp[11], sp[12], 128, 128);
+							dp[11] = op2_blend_pixel(sp[12], sp[13], 90,  166);
+							dp[12] = op2_blend_pixel(sp[13], sp[14], 52,  204);
+							dp[13] = op2_blend_pixel(sp[14], sp[15], 13,  243);
+							dp[14] = op2_blend_pixel(sp[16], sp[17], 231, 25);
+							dp[15] = op2_blend_pixel(sp[17], sp[18], 192, 64);
+							dp[16] = op2_blend_pixel(sp[18], sp[19], 154, 102);
+							dp[17] = op2_blend_pixel(sp[19], sp[20], 116, 140);
+							dp[18] = op2_blend_pixel(sp[20], sp[21], 77,  179);
+							dp[19] = op2_blend_pixel(sp[21], sp[22], 39,  217);
 						}
 					}
 					uint64_t dt = mach_absolute_time() - t0;
@@ -1430,19 +1663,27 @@ AppleCLCD::present(const uint8_t *rec)
 		/* Flip: make the freshly written buffer the scanout source. The
 		 * FLUSH in op2_fb_kick_panel latches SRC0 before START. */
 		__asm__ volatile("dsb sy" ::: "memory");
-		if (fActivePipe != NULL &&
-		    (op2_fb_direct_cur != 0 || fActivePipe[0x14 / 4] != (uint32_t)dstPhys)) {
-			fActivePipe[0x14 / 4] = (uint32_t)dstPhys;
-			fActivePipe[0x24 / 4] = fRowBytes;
+		if (fActivePipe != NULL) {
 			fActivePipe[0x00 / 4] = (fHeight << 16) | fWidth;
 			fActivePipe[0x04 / 4] = (fHeight << 16) | fWidth;
+			fActivePipe[0x08 / 4] = 0;
+			fActivePipe[0x0c / 4] = (fHeight << 16) | fWidth;
+			fActivePipe[0x10 / 4] = 0;
+			fActivePipe[0x14 / 4] = (uint32_t)dstPhys;
+			fActivePipe[0x24 / 4] = fRowBytes;
 			fActivePipe[0x30 / 4] = 0x000236ffu;
 			fActivePipe[0x34 / 4] = 0x03020001u;
+			if (fPipeHasScaler) {
+				fActivePipe[0x204 / 4] = 0;
+			}
 		}
 		op2_fb_direct_cur = 0;
 		fFrontBuf = dstIdx;
 		fPixels = dstPixels;
 	}
+
+	if ((pc % 240) == 0)
+		op2_fb_thumb(s, pc);
 
 	if (s != fSurface) {
 		s->release();
@@ -1453,6 +1694,41 @@ AppleCLCD::present(const uint8_t *rec)
 
 	/* Kick command-mode panel to send newly swapped frame to display GRAM */
 	op2_fb_kick_panel(fMdpCtl);
+}
+
+/*
+ * Log a tiny grayscale thumbnail of the presented frame (48x27, one hex
+ * digit per pixel) so the screen content is verifiable from the log alone:
+ * UI vs black vs garbage, without eyes on the panel. Every 240th present.
+ */
+static void
+op2_fb_thumb(OP2Surface *s, uint64_t pc)
+{
+	if (s == NULL || s->width < 48 || s->height < 27 || s->memory == NULL)
+		return;
+	uintptr_t psrc = s->kernelAddress();
+	if (psrc == 0)
+		return;
+	uint64_t need = s->offset + (uint64_t)s->height * s->bytesPerRow;
+	if (need > s->memory->getLength())
+		return;
+	uint32_t xs = s->width / 48, ys = s->height / 27;
+	if (xs < 1)
+		xs = 1;
+	if (ys < 1)
+		ys = 1;
+	char line[128];
+	for (uint32_t r = 0; r < 27; r++) {
+		const uint32_t *row = (const uint32_t *)(psrc + s->offset +
+		    (uint64_t)(r * ys) * s->bytesPerRow);
+		for (uint32_t c = 0; c < 48; c++) {
+			uint32_t px = row[c * xs];
+			uint32_t lum = ((px & 0xff) + ((px >> 8) & 0xff) + ((px >> 16) & 0xff)) / 3;
+			line[c] = "0123456789abcdef"[lum >> 4];
+		}
+		line[48] = '\0';
+		IOLog("OP2 FB THUMB #%llu r%u: %s\n", pc, r, line);
+	}
 }
 
 /*
@@ -1471,6 +1747,21 @@ uint32_t
 op2_fb_get_last_nz(void)
 {
 	return op2_fb_last_nz;
+}
+
+extern "C" bool op2_fb_is_power_off(void);
+extern "C" uint64_t op2_fb_get_last_kick(void);
+
+bool
+op2_fb_is_power_off(void)
+{
+	return (op2_fb_instance != NULL && op2_fb_instance->fPowerOff);
+}
+
+uint64_t
+op2_fb_get_last_kick(void)
+{
+	return op2_fb_last_kick;
 }
 
 /*
@@ -1501,8 +1792,8 @@ op2_fb_dump_stats(void)
 			samples++;
 		}
 	}
-	printf("OP2 FB STATS: presents=%llu kicks=%llu shown=%u active_phys=0x%08x direct_phys=0x%08llx panel=%ux%u panel_nz=%u/%u lastnz=%u\n",
-	    presents, kicks, shown, active_phys, op2_fb_last_direct_phys, w, h, panel_nz, samples, op2_fb_last_nz);
+	printf("OP2 FB STATS: presents=%llu kicks=%llu shown=%u active_phys=0x%08x direct_phys=0x%08llx panel=%ux%u panel_nz=%u/%u lastnz=%u hwscale=%d hwscale_count=%llu\n",
+	    presents, kicks, shown, active_phys, op2_fb_last_direct_phys, w, h, panel_nz, samples, op2_fb_last_nz, (int)op2_fb_hwscale_active, op2_fb_hwscale_count);
 	/* Output directly via printf to be captured in persistent ramoops buffer */
 	printf("OP2 FB LAST begin rec=%llu size=%u\n",
 	    op2_fb_last_pc, (uint32_t)sizeof(op2_fb_last_rec));
@@ -1651,7 +1942,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				PE_parse_boot_argn("op2fb_keepon", &sKeepOn, sizeof(sKeepOn));
 			}
 			if (sKeepOn != 0 && off) {
-				IOLog("OP2 FB: ignoring display off (op2fb_keepon active)\n");
+				IOLog("OP2 FB: userland display sleep requested (op2fb_keepon active, panel stays on)\n");
 				break;
 			}
 			IOLockLock(fFB->fLock);

@@ -40,9 +40,12 @@ This repository contains a specialized fork of Apple's open-source **Darwin/XNU 
 - 0 failures across 1.36M+ operations in prolonged soak runs.
 
 ### 3. Display Engine & Zero-Fill Preservation (`iokit/Kernel/arm/OP2Framebuffer.cpp`, `OP2Surface.cpp`)
-- Interfaces with Qualcomm continuous splash buffer at `0x03401000` (1080×1920, 32-bit ARGB/BGRA, 4352-byte padded stride).
-- Double-buffered (back buffer in carveout slot 1), SwapWait implemented, immediate present on SwapEnd, panel kicks deferred instead of dropped; ~6 ms per frame for the CPU downsample.
-- Scans userland surfaces up to ID 63, dynamically tracing SpringBoard's double-buffered Retina frames (1242×2208) and bilinearly downsampling to native 1080×1920.
+- Interfaces with Qualcomm continuous splash buffer at `0x03400000` (1080×1920, 32-bit ARGB/BGRA, 4352-byte padded stride).
+- Native MDSS MDP5 command-mode DSI scanout (CTL0 FLUSH/START) at 60 Hz.
+- **Zero Dropped Kicks:** Panel kickoff in `op2_fb_kick_panel` uses bounded `IODelay` instead of early dropped returns, ensuring static scenes and idle screens never leave the panel showing a stale frame.
+- **SIMD Subpixel Bilinear Downsampler (`op2fb_hwscale=0`):** Fixed-point 8-bit weighted bilinear downsampler (1242×2208 → 1080×1920) executes in ~2 ms into carveout slot 0. Bypasses the buggy Qualcomm QSEED hardware downscaler to prevent MDP5 AXI bus underflows and SMMU faults.
+- **Dynamic Surface Scanning:** Scans userland surfaces up to ID 255 (`sid < 256`), dynamically tracking SpringBoard and application double-buffered Retina frames.
+- **Carveout DMA Boundaries:** Verifies that physical addresses passed to MDP5 DMA stay within the safe continuous splash carveout (`0x03400000` to `0x05600000`).
 - **RGB Alpha Mask Fix:** Evaluates `(row[x] & 0x00FFFFFF) != 0` to differentiate opaque black (`0xFF000000`) from uninitialized buffers.
 - **Zero-Fill Guard:** Freezes existing panel memory (`fPixels`) during blank composite swaps, ensuring 100% of sampled panel pixels remain non-zero (`panel_nz = 2000/2000`).
 
@@ -73,6 +76,38 @@ Bring-up and results are written up in the iOS repository's `docs/GPU-PLAN.md`. 
 | `gpu_smmu_xlate` | 0 | identity translation of live buffers only |
 | `gpu_selftest` | 1000 | G0/G1 self-tests at boot |
 | `gpu_held` | 1 | quarantine closed buffers and check them for writes after close |
+
+---
+
+### 7. Battery & Fuel-Gauge Power Management (`iokit/Kernel/arm/OP2Battery.cpp`)
+- Implements Apple `IOPMPowerSource` driver publishing standard iOS battery telemetry for `powerd` and SpringBoard's status bar.
+- Direct hardware communication with Qualcomm PMI8994 PMIC (Slave ID 2) over Qualcomm SPMI PMIC Arbiter v1 (`0xFC4CF000`).
+- Monitors Fuel-Gauge Monotonic State of Charge (FG_SOC `0x4009`), charger presence and bus status via SMBCHG (`0x130D`/`0x1310`), and real-time battery voltage/current from FG MEM_IF SRAM.
+- Periodic 30-second workloop timer refresh; prevents `powerd` low-battery panic shutdown loops and uninitialized power assertions.
+
+---
+
+## Boot Arguments Reference
+
+The following kernel boot arguments govern hardware bring-up, memory management, and display behavior on the OnePlus 2. The default set configured in `tools/build-daily.sh` provides a stable, fully interactive, GPU-accelerated environment.
+
+| Boot Argument | Default | Critical? | Purpose & Impact |
+| :--- | :--- | :--- | :--- |
+| `op2fb_hwscale=0` | `0` | **YES** | **Bypasses Qualcomm QSEED hardware scaler.** Downscaling 1242×2208 frames is handled via SIMD subpixel bilinear downsampling directly into carveout slot 0 (`0x03400000`). Prevents MDP5 hardware AXI bus underflow faults and MDSS SMMU fatal panics. |
+| `op2fb_client_ui=1` | `1` | **YES** | Enables client UI fallback compositing so SpringBoard surfaces are reliably copied to scanout. |
+| `metal=3` | `3` | **YES** | Enables Level 3 Metal GPU acceleration via `OP2Metal` and Adreno 430 Mesa freedreno driver for backboardd, SpringBoard, and apps. |
+| `op2_autoinput=1` | `1` | **YES** | Enables wake-only synthetic input (pulses capacitive Home button once at boot to wake Lock Screen), then exits synthetic mode for hands-on user control. |
+| `op2fb_keepon=1` | `1` | **YES** | Prevents physical panel backlight sleep, maintaining active MDP5 scanout at all times. |
+| `op2_deadline=7200` | `7200` | **YES** | Hardware/software safety watchdog timer in seconds (default 2 hours, or 1800 for 30m soak). Automatically syncs filesystems and resets to TWRP recovery upon expiration, preventing battery drain or hard-lock. |
+| `rd=emmcroot0` | `emmcroot0` | **YES** | Directs XNU root filesystem to Qualcomm SDHCI eMMC block device `/dev/emmcroot0`. |
+| `emmcroot=userdata` | `userdata` | **YES** | Selects the internal `userdata` partition as the HFS+ root filesystem. |
+| `rootrw=1 emmcrw=1` | `1` | **YES** | Grants read-write access to eMMC and mounts root filesystem read-write. |
+| `cs_enforcement_disable=1` | `1` | **YES** | Disables Darwin code signing enforcement, allowing custom userland daemons and shims to execute. |
+| `launchd_unsecure_cache=1`| `1` | **YES** | Allows iOS 12 launchd to load patched `xpcd_cache.dylib` services without security cache rejection. |
+| `cpus=4` | `4` | **YES** | Boots all 4 Cortex-A53 cores on the power-efficient cluster via SCM mailbox bootstrap. |
+| `-v` | N/A | Optional | Verbose boot logging to console. |
+| `keepsyms=1` | `1` | Optional | Retains kernel symbol table in RAM for informative stack backtraces upon kernel panics. |
+| `op2_userlog=0` | `0` | Optional | Suppresses excessive userland log noise to prevent wrapping the 260 KB ramoops ring buffer. |
 
 ---
 
@@ -113,6 +148,7 @@ BUILD/obj/DEVELOPMENT_ARM64_MSM8994/kernel.development.msm8994
 * `iokit/Kernel/arm/OP2Framebuffer.cpp` — Qualcomm MDSS MDP5 framebuffer and `AppleCLCD` pipeline.
 * `iokit/Kernel/arm/OP2Surface.cpp` — Dynamic surface tracking and 1242×2208 downsampling engine.
 * `iokit/Kernel/arm/OP2Digitizer.cpp` — Synaptics touch and `OP2Buttons` Consumer HID service.
+* `iokit/Kernel/arm/OP2Battery.cpp` — Qualcomm PMI8994 SPMI battery fuel-gauge and `IOPMPowerSource` driver.
 * `iokit/Kernel/arm/OP2I2C.cpp` — Qualcomm BLSP I2C bus driver.
 * `iokit/Kernel/arm/OP2GPU.cpp`, `OP2GPU.h` — Adreno 430 driver and its msm-DRM user client.
 * `bsd/dev/op2_rpm.c` — RPM (SMD) client: power rails and RPM-owned clocks.

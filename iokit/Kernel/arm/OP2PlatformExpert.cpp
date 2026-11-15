@@ -13,6 +13,15 @@ extern "C" {
 #include <prng/random.h>
 void ml_init_max_cpus(unsigned int max_cpus);
 unsigned int ml_get_cpu_count(void);
+void msm8994_panic_reset(void);
+}
+
+static int
+op2_pe_halt_restart(unsigned int type)
+{
+	(void)type;
+	msm8994_panic_reset();
+	return 0;
 }
 
 class OP2PlatformExpert : public IODTPlatformExpert {
@@ -25,9 +34,40 @@ public:
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
 	bool getModelName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
 	bool getMachineName(char *name, int maxLength) APPLE_KEXT_OVERRIDE;
+	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
+	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
 };
 
 OSDefineMetaClassAndStructors(OP2PlatformExpert, IODTPlatformExpert);
+
+static uint64_t sGMTBaseSec = 1794571200ULL; /* Nov 13, 2026 baseline epoch */
+static uint64_t sBootMachTime = 0;
+
+long
+OP2PlatformExpert::getGMTTimeOfDay(void)
+{
+	if (sBootMachTime == 0) {
+		sBootMachTime = mach_absolute_time();
+	}
+	uint64_t elapsed_ticks = mach_absolute_time() - sBootMachTime;
+	uint64_t elapsed_sec = elapsed_ticks / 19200000ULL; /* MSM8994 19.2 MHz generic timer */
+	return (long)(sGMTBaseSec + elapsed_sec);
+}
+
+void
+OP2PlatformExpert::setGMTTimeOfDay(long secs)
+{
+	if (secs > 1500000000L) {
+		if (sBootMachTime == 0) {
+			sBootMachTime = mach_absolute_time();
+		}
+		uint64_t elapsed_ticks = mach_absolute_time() - sBootMachTime;
+		uint64_t elapsed_sec = elapsed_ticks / 19200000ULL;
+		sGMTBaseSec = (uint64_t)secs - elapsed_sec;
+		IOLog("OP2: setGMTTimeOfDay updated baseline epoch to %llu (target %ld)\n",
+		    sGMTBaseSec, secs);
+	}
+}
 
 bool
 OP2PlatformExpert::start(IOService *provider)
@@ -54,6 +94,7 @@ OP2PlatformExpert::start(IOService *provider)
 		}
 	}
 
+	PE_halt_restart = op2_pe_halt_restart;
 	publishResource("IORTC", kOSBooleanTrue);
 	registerService();
 	IOLog("OP2: platform expert registered successfully\n");

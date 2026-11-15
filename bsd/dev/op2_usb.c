@@ -23,6 +23,24 @@
 #include <sys/fcntl.h>
 #include <sys/vnode.h>
 #include <sys/kernel.h>
+#include <sys/ioctl.h>
+#include <sys/ttycom.h>
+#include <sys/termios.h>
+#include <sys/proc_internal.h>
+#define TTYDEFCHARS
+#include <sys/ttydefaults.h>
+#include <kern/locks.h>
+#include <sys/kpi_mbuf.h>
+#include <sys/kpi_socket.h>
+#include <sys/sockio.h>
+#include <net/if.h>
+#include <net/if_types.h>
+#include <net/ethernet.h>
+#include <net/if_ether.h>
+#include <net/ether_if_module.h>
+#include <net/kpi_interface.h>
+#include <net/kpi_protocol.h>
+#include <netinet/in.h>
 #include <miscfs/devfs/devfs.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -31,6 +49,15 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern void IOSleep(unsigned milliseconds);
 extern void IODelay(unsigned microseconds);
 extern void (*op2_usb_putc_hook)(int c);   /* pexpert/arm/pe_serial.c op2_ramoops_td0 */
+
+extern proc_t proc_find(int pid);
+extern int proc_rele(proc_t p);
+extern pid_t proc_pid(proc_t p);
+extern proc_t current_proc(void);
+extern struct pgrp *proc_pgrp(proc_t p);
+extern void pg_rele(struct pgrp *pgrp);
+extern void pgsignal(struct pgrp *pgrp, int signum, int checkctty);
+extern void psignal(struct proc *p, int signum);
 
 void op2_usb_start(void);
 
@@ -94,10 +121,14 @@ void op2_usb_start(void);
 #define EV_XFERNOTREADY      3
 #define EV_STATUS_CTRL_STATUS 2
 
-/* physical endpoints: 0 EP0 OUT, 1 EP0 IN, 2 EP1 OUT (bulk), 3 EP1 IN (bulk), 5 EP2 IN (interrupt) */
+/* physical endpoints: 0 EP0 OUT, 1 EP0 IN, 2 EP1 OUT (bulk), 3 EP1 IN (bulk), 5 EP2 IN (interrupt),
+ * 4 ECM OUT (bulk), 7 ECM IN (bulk), 9 ECM INT (interrupt). OUT addr N = phys 2N, IN addr N = phys 2N+1. */
 #define EP_BULK_OUT 2
 #define EP_BULK_IN  3
 #define EP_INTR_IN  5
+#define EP_ECM_OUT 4   /* addr 0x02 bulk OUT */
+#define EP_ECM_IN  7   /* addr 0x83 bulk IN */
+#define EP_ECM_INT 9   /* addr 0x84 interrupt IN */
 
 /* ---- DMA memory: one contiguous 32 KB block ---- */
 #define OFF_EVT     0x0000   /* 4 KB event buffer */
@@ -108,6 +139,11 @@ void op2_usb_start(void);
 #define OFF_TRBIN   0x1440
 #define OFF_IN      0x2000   /* bulk IN, 8 KB */
 #define OFF_OUT     0x4000   /* bulk OUT, 512 */
+#define OFF_TRBECM  0x4200   /* 3 ECM TRBs: OUT, IN, INT (16 B each) */
+#define OFF_ECM_NFY 0x4240   /* ECM notification, 16 B */
+#define OFF_ECM_RX  0x4300   /* one received frame, 2 KB */
+#define OFF_ECM_TX  0x4b00   /* one frame to send, 2 KB */
+#define ECM_FRAME_MAX 0x800
 #define MEM_BYTES   0x8000
 #define EVT_BYTES   4096
 
@@ -136,6 +172,7 @@ static volatile int usb_configured;
 
 static int wchan_in, wchan_out;   /* sleep/wakeup channels: lines to read, room to write */
 static volatile int shell_open;   /* /dev/op2usb open: the kernel log pauses, the terminal belongs to the shell */
+static volatile pid_t shell_pid;
 
 static void
 ring_put(int c)
@@ -147,7 +184,7 @@ ring_put(int c)
 static void
 op2_usb_putc(int c)   /* the console hook */
 {
-	if (!shell_open)
+	if (!shell_open && shell_pid <= 0)
 		ring_put(c);
 }
 
@@ -166,10 +203,21 @@ static char line_buf[512];
 static uint32_t line_len;
 static volatile int in_eof;
 
+/* minimal tty face: dash's job control needs isatty (FIODTYPE == D_TTY, via .d_type below: iOS 12's
+ * isatty never reaches TIOCGETA when FIODTYPE succeeds) and tcgetpgrp/tcsetpgrp (TIOCGPGRP/TIOCSPGRP)
+ * to succeed; winsize for COLUMNS/LINES. The line discipline itself stays fixed (see in_byte): TIOCSETA is
+ * stored so GET reads back what was SET. No controlling-terminal binding (no TIOCSCTTY): the checks below
+ * are pgfind + same-session, the isctty part of tty.c's TIOCSPGRP skipped by design. */
+static pid_t tty_fg;                 /* foreground pgrp; 0 = unset: answer the caller's own group */
+static struct termios tty_termios;
+static int tty_termios_set;
+static struct winsize tty_winsize = { 24, 80, 0, 0 };
+static int tty_fg_logged;            /* one live fg line per open */
+
 static void
 in_byte(uint8_t c)
 {
-	if (!shell_open)
+	if (!shell_open && shell_pid <= 0)
 		return;
 	if (c == '\r' || c == '\n') {
 		ring_puts("\r\n");
@@ -183,11 +231,35 @@ in_byte(uint8_t c)
 			line_len--;
 			ring_puts("\b \b");
 		}
-	} else if (c == 0x03) {        /* ^C: drop the line */
+	} else if (c == 0x03) {        /* ^C: SIGINT the foreground group (else the shell's) and drop line */
 		line_len = 0;
 		ring_puts("^C\r\n");
 		in_ring[(in_head++) & (IN_RING - 1)] = '\n';
 		wakeup((caddr_t)&wchan_in);
+		int done = 0;
+		if (tty_fg > 0) {   /* job control on: dash moves this per job, so ^C hits the foreground child */
+			struct pgrp *fg = pgfind(tty_fg);
+			if (fg != PGRP_NULL) {
+				pgsignal(fg, 2 /* SIGINT */, 0);
+				pg_rele(fg);
+				done = 1;
+			} else {
+				tty_fg = 0;   /* stale group: drop to the shell path */
+			}
+		}
+		if (!done && shell_pid > 0) {
+			proc_t p = proc_find(shell_pid);
+			if (p) {
+				struct pgrp *pg = proc_pgrp(p);
+				if (pg) {
+					pgsignal(pg, 2 /* SIGINT */, 0);
+					pg_rele(pg);
+				} else {
+					psignal(p, 2 /* SIGINT */);
+				}
+				proc_rele(p);
+			}
+		}
 	} else if (c == 0x04) {        /* ^D on an empty line: end of input */
 		if (line_len == 0) {
 			in_eof = 1;
@@ -230,43 +302,68 @@ trb(uint32_t off, uint32_t buf_pa, uint32_t len, uint32_t ctrl)
 	civac(off, 16);
 }
 
-static int ep_rsc[6];
+static int ep_rsc[10];   /* transfer resource idx, by physical ep (ECM uses 4, 7, 9) */
+static int ep_started[10];
+static unsigned start_fail;   /* STARTTRANSFER failures, all endpoints (in the periodic line) */
+
+static void
+start_failed(const char *site, int r)
+{
+	start_fail++;
+	if (start_fail < 8)
+		printf("OP2 USB: start failed: %s %d\n", site, r);
+}
+
 static int
 start_xfer(int ep, uint32_t trb_off)
 {
 	int r = depcmd(ep, CMD_STARTTRANSFER, 0, PA(trb_off), 0);
-	if (r >= 0)
+	if (r >= 0) {
 		ep_rsc[ep] = r;
+		ep_started[ep] = 1;
+	}
 	return r;
 }
 
-/* ---- descriptors: CDC-ACM, Linux gadget serial ids (macOS binds by class) ---- */
+/* ---- descriptors: composite CDC-ACM (console) + CDC-ECM (network), Linux gadget serial ids ---- */
 static const uint8_t dev_desc[18] = {
-	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64, 0x25, 0x05, 0xa7, 0xa4, 0x00, 0x01, 1, 2, 3, 1,
+	18, 1, 0x00, 0x02, 0xef, 0x02, 0x01, 64, 0x25, 0x05, 0xa7, 0xa4, 0x00, 0x01, 1, 2, 3, 1,
 };
-static const uint8_t cfg_desc[67] = {
-	9, 2, 67, 0, 2, 1, 0, 0x80, 250,
-	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,                 /* comm interface, 1 ep */
-	5, 0x24, 0x00, 0x10, 0x01,                          /* CDC header 1.10 */
-	5, 0x24, 0x01, 0x00, 1,                             /* call management: data on interface 1 */
-	4, 0x24, 0x02, 0x02,                                /* ACM: line coding + control line state */
-	5, 0x24, 0x06, 0, 1,                                /* union: master 0, slave 1 */
-	7, 5, 0x82, 0x03, 16, 0, 9,                         /* EP2 IN interrupt, 16 B, 2^(9-1) microframes */
-	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,                 /* data interface, 2 eps */
-	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                    /* EP1 OUT bulk 512 */
-	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                    /* EP1 IN bulk 512 */
+static const uint8_t cfg_desc[154] = {
+	9, 2, 154, 0, 4, 1, 0, 0x80, 250,                /* config: 4 interfaces, 500 mA */
+	8, 11, 0, 2, 0x02, 0x02, 0x01, 0,               /* IAD: ACM on interfaces 0-1 */
+	9, 4, 0, 0, 1, 0x02, 0x02, 0x01, 0,             /* ACM comm interface, 1 ep */
+	5, 0x24, 0x00, 0x10, 0x01,                      /* CDC header 1.10 */
+	5, 0x24, 0x01, 0x00, 1,                         /* call management: data on interface 1 */
+	4, 0x24, 0x02, 0x02,                            /* ACM: line coding + control line state */
+	5, 0x24, 0x06, 0, 1,                            /* union: master 0, slave 1 */
+	7, 5, 0x82, 0x03, 16, 0, 9,                     /* EP2 IN interrupt, 16 B, 2^(9-1) microframes */
+	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,             /* ACM data interface, 2 eps */
+	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* EP1 OUT bulk 512 */
+	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* EP1 IN bulk 512 */
+	8, 11, 2, 2, 0x02, 0x06, 0x00, 0,               /* IAD: ECM on interfaces 2-3 */
+	9, 4, 2, 0, 1, 0x02, 0x06, 0x00, 0,             /* ECM comm interface, 1 ep */
+	5, 0x24, 0x00, 0x10, 0x01,                      /* CDC header 1.10 */
+	5, 0x24, 0x06, 2, 3,                            /* union: master 2, slave 3 */
+	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: iMAC 4, max segment 1514 */
+	7, 5, 0x84, 0x03, 16, 0, 9,                     /* EP4 IN interrupt, 16 B */
+	9, 4, 3, 0, 0, 0x0a, 0x00, 0x00, 0,             /* ECM data alt 0: no eps */
+	9, 4, 3, 1, 2, 0x0a, 0x00, 0x00, 0,             /* ECM data alt 1: two bulk eps */
+	7, 5, 0x02, 0x02, 0x00, 0x02, 0,                /* EP2 OUT bulk 512 */
+	7, 5, 0x83, 0x02, 0x00, 0x02, 0,                /* EP3 IN bulk 512 */
 };
 static uint8_t line_coding[7] = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 };   /* 115200 8N1 */
 
 static int
 string_desc(int idx, uint8_t *out)
 {
-	static const char *s[] = { NULL, "OnePlus 2 XNU", "OP2 USB console", "0001" };
+	/* string 4 is the ECM host-side MAC (the phone's own is ..:02, S2) */
+	static const char *s[] = { NULL, "OnePlus 2 XNU", "OP2 USB console", "0001", "02005E77EE01" };
 	if (idx == 0) {
 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;
 		return 4;
 	}
-	if (idx < 1 || idx > 3)
+	if (idx < 1 || idx > 4)
 		return -1;
 	int n = 2;
 	for (const char *p = s[idx]; *p; p++) {
@@ -321,7 +418,304 @@ out_arm(void)
 {
 	trb(OFF_TRBOUT, PA(OFF_OUT), 512, TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC | TRBCTL_NORMAL);
 	civac(OFF_OUT, 512);
-	out_armed = start_xfer(EP_BULK_OUT, OFF_TRBOUT) >= 0;
+	int r = start_xfer(EP_BULK_OUT, OFF_TRBOUT);
+	out_armed = r >= 0;
+	if (!out_armed)
+		start_failed("bulk-out", r);
+}
+
+/* ---- ECM: endpoints + link notification (S1); ue0 network interface (S2) ---- */
+static int ecm_alt;   /* ECM data interface (3) alternate setting */
+static int ecm_desc_err = -1;
+static volatile int ecm_notify_busy;
+
+#define ECM_TXQ 32
+static ifnet_t ecm_ifp;
+static lck_mtx_t *ecm_lock;   /* TX queue and TX endpoint */
+static mbuf_t ecm_txq[ECM_TXQ];
+static unsigned ecm_txq_head, ecm_txq_count;
+static int ecm_tx_busy, ecm_rx_armed;
+static uint64_t ecm_rx_frames, ecm_tx_frames;
+static unsigned ecm_rx_drops;
+static const uint8_t ecm_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+
+static void
+ecm_rx_arm(void)
+{
+	int r;
+	if (ecm_rx_armed || !usb_configured)
+		return;
+	trb(OFF_TRBECM, PA(OFF_ECM_RX), ECM_FRAME_MAX,
+	    TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC | TRBCTL_NORMAL);
+	civac(OFF_ECM_RX, ECM_FRAME_MAX);
+	r = start_xfer(EP_ECM_OUT, OFF_TRBECM);
+	if (r >= 0)
+		ecm_rx_armed = 1;
+	else
+		start_failed("ecm-rx", r);
+}
+
+static void
+ecm_rx_done(void)
+{
+	volatile uint32_t *t = (volatile uint32_t *)(void *)(mem + OFF_TRBECM);
+	uint32_t len;
+	ecm_rx_armed = 0;
+	civac(OFF_TRBECM, 16);
+	len = ECM_FRAME_MAX - (t[2] & 0xffffff);
+	civac(OFF_ECM_RX, ECM_FRAME_MAX);
+	if (ecm_ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+		/* single mbuf (maxchunks 1): copyback on a fresh 2-mbuf packet fills only the second
+		 * mbuf, leaving the first at length 0, and the header split below would underflow. */
+		unsigned int one = 1;
+		mbuf_t m = NULL;
+		if (mbuf_allocpacket(MBUF_DONTWAIT, len, &one, &m) == 0 &&
+		    mbuf_copyback(m, 0, len, (const void *)(mem + OFF_ECM_RX), MBUF_DONTWAIT) == 0 &&
+		    mbuf_len(m) >= ETHER_HDR_LEN) {
+			struct ifnet_stat_increment_param stats = { 0 };
+			void *frame_header = mbuf_data(m);
+			mbuf_pkthdr_setrcvif(m, ecm_ifp);
+			mbuf_pkthdr_setheader(m, frame_header);
+			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN,
+			    mbuf_len(m) - ETHER_HDR_LEN);
+			stats.packets_in = 1;
+			stats.bytes_in = len;
+			ecm_rx_frames++;
+			ifnet_input(ecm_ifp, m, &stats);
+		} else {
+			if (m != NULL) {
+				if (ecm_rx_drops < 8)
+					printf("OP2 USB: ECM: rx drop len %u mlen %d\n", len,
+					    (int)mbuf_len(m));
+				mbuf_freem(m);
+			}
+			ecm_rx_drops++;
+		}
+	}
+	ecm_rx_arm();
+}
+
+/* Start the next queued frame if the IN endpoint is idle. ecm_lock held. */
+static void
+ecm_tx_kick_locked(void)
+{
+	while (!ecm_tx_busy && ecm_txq_count > 0 && usb_configured) {
+		mbuf_t m = ecm_txq[ecm_txq_head];
+		size_t len;
+		int r;
+		ecm_txq_head = (ecm_txq_head + 1) % ECM_TXQ;
+		ecm_txq_count--;
+		len = mbuf_pkthdr_len(m);
+		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
+			mbuf_freem(m);
+			continue;
+		}
+		mbuf_copydata(m, 0, len, (void *)(mem + OFF_ECM_TX));
+		mbuf_freem(m);
+		if ((len % 512) == 0)
+			mem[OFF_ECM_TX + len++] = 0;   /* pad instead of a zero-length packet */
+		civac(OFF_ECM_TX, (uint32_t)len);
+		trb(OFF_TRBECM + 16, PA(OFF_ECM_TX), (uint32_t)len,
+		    TRB_HWO | TRB_LST | TRB_IOC | TRBCTL_NORMAL);
+		r = start_xfer(EP_ECM_IN, OFF_TRBECM + 16);
+		if (r < 0) {
+			start_failed("ecm-tx", r);
+			return;
+		}
+		ecm_tx_busy = 1;
+		ecm_tx_frames++;
+	}
+}
+
+static errno_t
+ecm_if_output(ifnet_t ifp, mbuf_t m)
+{
+	lck_mtx_lock(ecm_lock);
+	if (ecm_txq_count == ECM_TXQ || !usb_configured) {
+		lck_mtx_unlock(ecm_lock);
+		mbuf_freem(m);
+		ifnet_stat_increment_out(ifp, 0, 0, 1);
+		return 0;
+	}
+	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
+	ecm_txq[(ecm_txq_head + ecm_txq_count) % ECM_TXQ] = m;
+	ecm_txq_count++;
+	ecm_tx_kick_locked();
+	lck_mtx_unlock(ecm_lock);
+	return 0;
+}
+
+static errno_t
+ecm_if_ioctl(ifnet_t ifp, unsigned long cmd, __unused void *data)
+{
+	switch (cmd) {
+	case SIOCSIFADDR:
+	case SIOCAIFADDR:
+		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+		return 0;
+	case SIOCSIFFLAGS:
+	case SIOCADDMULTI:
+	case SIOCDELMULTI:
+		return 0;
+	default:
+		return EOPNOTSUPP;
+	}
+}
+
+static void
+ecm_if_detach(__unused ifnet_t ifp)
+{
+}
+
+/* ue0, 192.168.7.2/24 (the Mac side is 192.168.7.1). */
+static void
+ecm_if_create(void)
+{
+	struct ifnet_init_eparams init;
+	lck_grp_t *grp;
+	errno_t err;
+	socket_t so = NULL;
+
+	grp = lck_grp_alloc_init("op2usb-ecm", LCK_GRP_ATTR_NULL);
+	ecm_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+
+	bzero(&init, sizeof(init));
+	init.ver = IFNET_INIT_CURRENT_VERSION;
+	init.len = sizeof(init);
+	init.flags = IFNET_INIT_LEGACY;
+	init.uniqueid = "op2-usb-ecm";
+	init.uniqueid_len = sizeof("op2-usb-ecm") - 1;
+	init.name = "ue";
+	init.unit = 0;
+	init.family = IFNET_FAMILY_ETHERNET;
+	init.type = IFT_ETHER;
+	init.output = ecm_if_output;
+	init.demux = ether_demux;
+	init.add_proto = ether_add_proto;
+	init.del_proto = ether_del_proto;
+	init.check_multi = ether_check_multi;
+	init.framer_extended = ether_frameout_extended;
+	init.ioctl = ecm_if_ioctl;
+	init.detach = ecm_if_detach;
+	init.broadcast_addr = etherbroadcastaddr;
+	init.broadcast_len = ETHER_ADDR_LEN;
+	if (ifnet_allocate_extended(&init, &ecm_ifp) != 0) {
+		printf("OP2 USB: ECM: ifnet_allocate failed\n");
+		ecm_ifp = NULL;
+		return;
+	}
+	ifnet_set_addrlen(ecm_ifp, ETHER_ADDR_LEN);
+	ifnet_set_hdrlen(ecm_ifp, sizeof(struct ether_header));
+	ifnet_set_mtu(ecm_ifp, ETHERMTU);
+	ifnet_set_baudrate(ecm_ifp, 480000000);
+	ifnet_set_flags(ecm_ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
+	if (ifnet_attach(ecm_ifp, NULL) != 0) {
+		printf("OP2 USB: ECM: ifnet_attach failed\n");
+		ecm_ifp = NULL;
+		return;
+	}
+	ifnet_set_lladdr(ecm_ifp, ecm_phone_mac, ETHER_ADDR_LEN);
+
+	err = proto_plumb(PF_INET, ecm_ifp);
+	if (err == 0)
+		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+	if (err == 0) {
+		struct ifaliasreq ifra;
+		struct sockaddr_in a4;
+		bzero(&ifra, sizeof(ifra));
+		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
+		bzero(&a4, sizeof(a4));
+		a4.sin_len = sizeof(a4);
+		a4.sin_family = AF_INET;
+		a4.sin_addr.s_addr = htonl(0xc0a80702);   /* 192.168.7.2 */
+		memcpy(&ifra.ifra_addr, &a4, sizeof(a4));
+		a4.sin_addr.s_addr = htonl(0xffffff00);
+		memcpy(&ifra.ifra_mask, &a4, sizeof(a4));
+		a4.sin_addr.s_addr = htonl(0xc0a807ff);
+		memcpy(&ifra.ifra_broadaddr, &a4, sizeof(a4));
+		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+		sock_close(so);
+	}
+	ifnet_set_flags(ecm_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+	printf("OP2 USB: ECM: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+}
+
+static void
+ecm_net_down(void)   /* drop queued frames on reset/unconfigure; RX re-arms at configure */
+{
+	if (ecm_lock == NULL)
+		return;
+	lck_mtx_lock(ecm_lock);
+	while (ecm_txq_count > 0) {
+		mbuf_freem(ecm_txq[ecm_txq_head]);
+		ecm_txq_head = (ecm_txq_head + 1) % ECM_TXQ;
+		ecm_txq_count--;
+	}
+	ecm_tx_busy = 0;
+	lck_mtx_unlock(ecm_lock);
+	ecm_rx_armed = 0;
+}
+
+static void
+ecm_notify(void)   /* NETWORK_CONNECTION(connected): the host brings its link up on it */
+{
+	uint8_t *n;
+	if (ecm_notify_busy || !usb_configured)
+		return;
+	n = mem + OFF_ECM_NFY;
+	n[0] = 0xa1; n[1] = 0x00;
+	n[2] = 1; n[3] = 0;
+	n[4] = 2; n[5] = 0;   /* interface 2 */
+	n[6] = 0; n[7] = 0;
+	civac(OFF_ECM_NFY, 16);
+	trb(OFF_TRBECM + 32, PA(OFF_ECM_NFY), 8, TRB_HWO | TRB_LST | TRB_IOC | TRBCTL_NORMAL);
+	int r = start_xfer(EP_ECM_INT, OFF_TRBECM + 32);
+	if (r >= 0) {
+		ecm_notify_busy = 1;
+		printf("OP2 USB: ECM: notified connected\n");
+	} else {
+		start_failed("ecm-notify", r);
+	}
+}
+
+/* descriptor self-check: walk the config, count interfaces/IADs/endpoints, endpoint addresses unique.
+ * Static-byte mistakes are the main way S1 fails, so this runs before the takeover. One line. */
+static void
+ecm_desc_check(void)
+{
+	uint32_t off = 0, ifaces = 0, iads = 0, eps = 0, seen = 0;
+	int err = 0;
+	if (sizeof(cfg_desc) != 154 || cfg_desc[0] != 9 || cfg_desc[1] != 2 ||
+	    cfg_desc[2] != sizeof(cfg_desc) || cfg_desc[3] != 0 || cfg_desc[4] != 4)
+		err |= 1;
+	while (off < sizeof(cfg_desc)) {
+		uint32_t len = cfg_desc[off], type = off + 1 < sizeof(cfg_desc) ? cfg_desc[off + 1] : 0;
+		if (len < 2 || off + len > sizeof(cfg_desc)) {
+			err |= 2;
+			break;
+		}
+		if (type == 4 && len == 9 && cfg_desc[off + 3] == 0)
+			ifaces++;
+		else if (type == 11 && len == 8)
+			iads++;
+		else if (type == 5 && len == 7) {
+			uint32_t a = cfg_desc[off + 2];
+			uint32_t bit = (a & 0x80) ? (1u << (16 + (a & 0x0f))) : (1u << (a & 0x0f));
+			eps++;
+			if (a == 0 || a == 0x80 || (a & 0x7f) == 0 || (seen & bit)) {
+				err |= 4;
+			} else {
+				seen |= bit;
+			}
+		}
+		off += len;
+	}
+	if (ifaces != 4 || iads != 2 || eps != 6)
+		err |= 8;
+	ecm_desc_err = err;
+	printf("OP2 USB: ECM desc check: %s (err 0x%x, if %u iad %u ep %u)\n", err ? "FAIL" : "PASS", err, ifaces,
+	    iads, eps);
 }
 
 static void
@@ -329,16 +723,24 @@ set_configuration(int cfg)
 {
 	if (cfg == 0) {
 		usb_configured = 0;
+		ecm_alt = 0;
+		ecm_notify_busy = 0;
+		ecm_net_down();
 		return;
 	}
-	depcmd(0, CMD_DEPSTARTCFG | CMD_PARAM(2), 0, 0, 0);
+	depcmd(0, CMD_DEPSTARTCFG | CMD_PARAM(2), 0, 0, 0);   /* XferRscIdx 2: all non-EP0 eps, once */
 	ep_enable(EP_BULK_OUT, 2, 512, 0);
 	ep_enable(EP_BULK_IN, 2, 512, 0);
 	ep_enable(EP_INTR_IN, 3, 16, 9);
+	ep_enable(EP_ECM_OUT, 2, 512, 0);
+	ep_enable(EP_ECM_IN, 2, 512, 0);
+	ep_enable(EP_ECM_INT, 3, 16, 9);
 	in_busy = 0;
 	out_arm();
 	usb_configured = 1;
-	printf("OP2 USB: configured: CDC-ACM console up\n");
+	ecm_rx_arm();   /* ue0 itself is created at mount-root time (below), not here: SET_CONFIGURATION can
+	                 * arrive before dlil_init, and ifnet_allocate then panics on its lock */
+	printf("OP2 USB: configured: CDC-ACM console + CDC-ECM up\n");
 }
 
 /* reply to an IN request: data stage on EP0 IN */
@@ -364,14 +766,20 @@ ep0_handle_setup(void)
 	civac(OFF_SETUP, 8);
 	const uint8_t *s = mem + OFF_SETUP;
 	uint8_t type = s[0], req = s[1];
-	uint16_t value = (uint16_t)(s[2] | s[3] << 8), wlength = (uint16_t)(s[6] | s[7] << 8);
+	uint16_t value = (uint16_t)(s[2] | s[3] << 8), index = (uint16_t)(s[4] | s[5] << 8),
+	    wlength = (uint16_t)(s[6] | s[7] << 8);
 	if (ev_logged < 40) {
 		ev_logged++;
-		printf("OP2 USB: setup %02x %02x val %04x len %u\n", type, req, value, wlength);
+		printf("OP2 USB: setup %02x %02x val %04x idx %04x len %u\n", type, req, value, index, wlength);
 	}
 	ep0_three_stage = 0;
 	ep0_status_ep = 1;   /* no data stage: status IN */
 	ep0_data_out_req = 0;
+	/* class OUT with no data stage (SET_ETHERNET_PACKET_FILTER, SET_CONTROL_LINE_STATE): accept */
+	if ((type & 0xe0) == 0x20 && wlength == 0 && req != 0x20) {
+		ep0_state = EP0_WAIT_STATUS;
+		return;
+	}
 	uint8_t buf[64];
 	switch ((type << 8) | req) {
 	case 0x8006: {   /* GET_DESCRIPTOR */
@@ -413,9 +821,23 @@ ep0_handle_setup(void)
 		ep0_data_out_req = 0x20;
 		return;
 	case 0x2122:     /* SET_CONTROL_LINE_STATE (DTR/RTS) */
-	case 0x0001: case 0x0003: case 0x0101: case 0x0103: case 0x000b: case 0x010b:   /* features, SET_INTERFACE */
+	case 0x0001: case 0x0003: case 0x0101: case 0x0103: case 0x000b:   /* features, endpoint SET_INTERFACE */
 	case 0x0201: case 0x0203:
 		break;
+	case 0x010b:     /* SET_INTERFACE (interface recipient) */
+		if (index == 3) {
+			ecm_alt = value & 0xff;
+			printf("OP2 USB: ECM: data alt %d\n", ecm_alt);
+			if (ecm_alt == 1 && usb_configured) {
+				ecm_notify();
+				ecm_rx_arm();
+			}
+		}
+		break;
+	case 0x810a:     /* GET_INTERFACE */
+		buf[0] = index == 3 ? (uint8_t)ecm_alt : 0;
+		ep0_reply(buf, 1, wlength);
+		return;
 	default:
 		ep0_stall();
 		return;
@@ -463,6 +885,9 @@ ep0_configure(uint32_t maxp, bool modify)
 static void
 end_xfer(int ep)
 {
+	if (!ep_started[ep])
+		return;   /* never started: no resource to end (a bogus idx would hit a live transfer) */
+	ep_started[ep] = 0;
 	depcmd(ep, CMD_ENDTRANSFER | CMD_HIPRI_FORCERM | CMD_PARAM(ep_rsc[ep]), 0, 0, 0);
 }
 
@@ -481,10 +906,16 @@ device_event(int evt)
 		if (usb_configured || in_busy || out_armed) {
 			end_xfer(EP_BULK_IN);
 			end_xfer(EP_BULK_OUT);
+			end_xfer(EP_ECM_IN);
+			end_xfer(EP_ECM_OUT);
+			end_xfer(EP_ECM_INT);
 		}
 		usb_configured = 0;
 		in_busy = 0;
 		out_armed = 0;
+		ecm_alt = 0;
+		ecm_notify_busy = 0;
+		ecm_net_down();
 		WR(DCFG, RD(DCFG) & ~DCFG_DEVADDR_MASK);
 		break;
 	case 2: { /* connect done: the speed is known, EP0's max packet with it */
@@ -509,6 +940,17 @@ ep_event(int ep, int evt, int status)
 	if (ep == EP_BULK_IN) {
 		in_busy = 0;
 		wakeup((caddr_t)&wchan_out);
+	} else if (ep == EP_ECM_INT) {
+		ecm_notify_busy = 0;
+	} else if (ep == EP_ECM_OUT) {
+		ecm_rx_done();
+	} else if (ep == EP_ECM_IN) {
+		if (ecm_lock != NULL) {
+			lck_mtx_lock(ecm_lock);
+			ecm_tx_busy = 0;
+			ecm_tx_kick_locked();
+			lck_mtx_unlock(ecm_lock);
+		}
 	} else if (ep == EP_BULK_OUT) {
 		civac(OFF_TRBOUT, 16);
 		uint32_t left = ((volatile uint32_t *)(void *)(mem + OFF_TRBOUT))[2] & 0xffffff;
@@ -538,9 +980,12 @@ pump_in(void)
 		mem[OFF_IN + i] = (uint8_t)ring_buf[(tail + i) & (RING - 1)];
 	civac(OFF_IN, n);
 	trb(OFF_TRBIN, PA(OFF_IN), n, TRB_HWO | TRB_LST | TRB_IOC | TRBCTL_NORMAL);
-	if (start_xfer(EP_BULK_IN, OFF_TRBIN) >= 0) {
+	int r = start_xfer(EP_BULK_IN, OFF_TRBIN);
+	if (r >= 0) {
 		in_busy = 1;
 		ring_tail = tail + n;
+	} else {
+		start_failed("bulk-in", r);
 	}
 }
 
@@ -577,13 +1022,92 @@ wait_bit(uint32_t reg, uint32_t bit, bool set, int ms)
 }
 
 /* ---- /dev/op2usb: the shell's stdin/stdout ---- */
+static int op2usb_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, struct proc *p);
+
+static void
+tty_defaults(void)
+{
+	if (tty_termios_set)
+		return;
+	memset(&tty_termios, 0, sizeof tty_termios);
+	tty_termios.c_iflag = TTYDEF_IFLAG;
+	tty_termios.c_oflag = TTYDEF_OFLAG;
+	tty_termios.c_cflag = TTYDEF_CFLAG;
+	tty_termios.c_lflag = TTYDEF_LFLAG;
+	memcpy(tty_termios.c_cc, ttydefchars, sizeof tty_termios.c_cc);
+	tty_termios.c_ispeed = tty_termios.c_ospeed = B115200;
+	tty_termios_set = 1;
+}
+
+/* direct ioctl round-trips on every open, before dash probes: termios store/read-back, winsize
+ * store/read-back, the lazy fg default (must be the opener's own group: dash SIGTTIN-stops itself
+ * if tcgetpgrp answers anything else), bogus pgid refused, live pgid accepted. One line. */
+static void
+tty_selftest(struct proc *p)
+{
+	struct termios t;
+	struct winsize ws;
+	int grp, err = 0;
+	tty_fg = 0;
+	tty_fg_logged = 1;   /* the test's own TIOCSPGRP stays quiet; the shell's still logs */
+	memset(&t, 0, sizeof t);
+	t.c_ispeed = t.c_ospeed = 9600;
+	t.c_lflag = ECHO;
+	if (op2usb_ioctl(0, TIOCSETA_64, (caddr_t)&t, 0, p) != 0)
+		err |= 1;
+	memset(&t, 0, sizeof t);
+	if (op2usb_ioctl(0, TIOCGETA_64, (caddr_t)&t, 0, p) != 0 || t.c_ospeed != 9600 || t.c_lflag != ECHO)
+		err |= 2;
+	tty_termios_set = 0;
+	tty_defaults();
+	if (tty_termios.c_ispeed != B115200 || !(tty_termios.c_lflag & ICANON))
+		err |= 4;
+	ws.ws_row = 50;
+	ws.ws_col = 132;
+	ws.ws_xpixel = ws.ws_ypixel = 0;
+	if (op2usb_ioctl(0, TIOCSWINSZ, (caddr_t)&ws, 0, p) != 0)
+		err |= 8;
+	memset(&ws, 0, sizeof ws);
+	if (op2usb_ioctl(0, TIOCGWINSZ, (caddr_t)&ws, 0, p) != 0 || ws.ws_row != 50 || ws.ws_col != 132)
+		err |= 0x10;
+	tty_winsize.ws_row = 24;
+	tty_winsize.ws_col = 80;
+	tty_winsize.ws_xpixel = tty_winsize.ws_ypixel = 0;
+	if (p == NULL) {
+		err |= 0x20;
+	} else {
+		struct pgrp *pg = proc_pgrp(p);
+		int mine = pg != PGRP_NULL ? pg->pg_id : -1;
+		if (pg != PGRP_NULL)
+			pg_rele(pg);
+		grp = 0;
+		if (op2usb_ioctl(0, TIOCGPGRP, (caddr_t)&grp, 0, p) != 0 || grp != mine)
+			err |= 0x20;
+		grp = 0x7fffffff;
+		if (op2usb_ioctl(0, TIOCSPGRP, (caddr_t)&grp, 0, p) != EINVAL)
+			err |= 0x40;
+		grp = mine;
+		if (op2usb_ioctl(0, TIOCSPGRP, (caddr_t)&grp, 0, p) != 0)
+			err |= 0x80;
+		grp = 0;
+		if (op2usb_ioctl(0, TIOCGPGRP, (caddr_t)&grp, 0, p) != 0 || grp != mine)
+			err |= 0x100;
+	}
+	tty_fg = 0;   /* leave unset: the shell's first tcgetpgrp defaults to its own group */
+	tty_fg_logged = 0;
+	printf("OP2 USB: tty self-test: %s (err 0x%x)\n", err ? "FAIL" : "PASS", err);
+}
+
 static int
-op2usb_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+op2usb_open(__unused dev_t dev, __unused int flags, __unused int devtype, struct proc *p)
 {
 	line_len = 0;
 	in_tail = in_head;
 	in_eof = 0;
 	shell_open++;
+	if (p)
+		shell_pid = proc_pid(p);
+	tty_selftest(p);
 	return 0;
 }
 
@@ -599,6 +1123,9 @@ op2usb_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unu
 static int
 op2usb_read(__unused dev_t dev, struct uio *uio, int ioflag)
 {
+	proc_t cp = current_proc();
+	if (cp)
+		shell_pid = proc_pid(cp);
 	while (in_tail == in_head) {
 		if (in_eof) {
 			in_eof = 0;
@@ -618,6 +1145,8 @@ op2usb_read(__unused dev_t dev, struct uio *uio, int ioflag)
 			if (buf[n - 1] == '\n')
 				break;
 		}
+		if (n == 0)
+			break;
 		int e = uiomove(buf, (int)n, uio);
 		if (e)
 			return e;
@@ -648,10 +1177,67 @@ op2usb_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 }
 
 static int
-op2usb_ioctl(__unused dev_t dev, __unused u_long cmd, __unused caddr_t data, __unused int fflag,
-    __unused struct proc *p)
+op2usb_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fflag, struct proc *p)
 {
-	return ENOTTY;
+	/* plain TIOCGETA/TIOCSETA == the _64 forms on LP64 (tty.c switches on the _64 names too);
+	 * no _32 forms: there are no 32-bit processes. data is already in kernel memory. */
+	tty_defaults();
+	switch (cmd) {
+	case TIOCGETA_64:
+		memcpy(data, &tty_termios, sizeof tty_termios);
+		return 0;
+	case TIOCSETA_64:
+	case TIOCSETAW_64:
+	case TIOCSETAF_64:
+		memcpy(&tty_termios, data, sizeof tty_termios);
+		return 0;
+	case TIOCGWINSZ:
+		memcpy(data, &tty_winsize, sizeof tty_winsize);
+		return 0;
+	case TIOCSWINSZ:
+		memcpy(&tty_winsize, data, sizeof tty_winsize);
+		return 0;
+	case TIOCGPGRP: {
+		if (p == NULL)
+			return EINVAL;
+		if (tty_fg == 0) {
+			struct pgrp *pg = proc_pgrp(p);
+			if (pg == PGRP_NULL)
+				return EINVAL;
+			tty_fg = pg->pg_id;
+			pg_rele(pg);
+		}
+		memcpy(data, &tty_fg, sizeof tty_fg);
+		return 0;
+	}
+	case TIOCSPGRP: {
+		struct pgrp *pg;
+		struct session *caller;
+		int want, err = 0;
+		if (p == NULL)
+			return EINVAL;
+		memcpy(&want, data, sizeof want);
+		pg = want > 0 ? pgfind(want) : PGRP_NULL;
+		if (pg == PGRP_NULL)
+			return EINVAL;
+		caller = proc_session(p);
+		if (caller == SESSION_NULL || pg->pg_session != caller) {
+			err = EPERM;
+		} else {
+			tty_fg = pg->pg_id;
+			if (!tty_fg_logged) {
+				tty_fg_logged = 1;
+				printf("OP2 USB: /dev/op2usb fg pgrp %d (pid %d)\n", tty_fg, proc_pid(p));
+			}
+		}
+		if (caller != SESSION_NULL)
+			session_rele(caller);
+		pg_rele(pg);
+		return err;
+	}
+	default:
+		return ENOTTY;
+	}
 }
 
 static struct cdevsw op2usb_cdevsw = {
@@ -668,12 +1254,13 @@ static struct cdevsw op2usb_cdevsw = {
 	.d_strategy = eno_strat,
 	.d_reserved_1 = eno_getc,
 	.d_reserved_2 = eno_putc,
-	.d_type = 0,
+	.d_type = D_TTY,   /* FIODTYPE answers this (vfs_vnops.c); iOS 12 isatty is true iff it is D_TTY */
 };
 
 __attribute__((noreturn)) static void
 op2_usb_thread(__unused void *param, __unused wait_result_t wr)
 {
+	ecm_desc_check();
 	/* 1. stop, device soft reset */
 	WR(DCTL, RD(DCTL) & ~DCTL_RUN_STOP);
 	int halted = wait_bit(DSTS, DSTS_DEVCTRLHLT, true, 100);
@@ -714,10 +1301,16 @@ op2_usb_thread(__unused void *param, __unused wait_result_t wr)
 			if (cmajor >= 0)
 				devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "op2usb");
 			printf("OP2 USB: /dev/op2usb major %d\n", cmajor);
+			if (ecm_ifp == NULL)   /* root mounted: dlil is up (bsd_init.c), ue0 is safe now */
+				ecm_if_create();
 		}
 		if (n == 30000)
 			printf("OP2 USB: 30 s: configured %d, line %u baud, %u bytes in\n", usb_configured,
 			    line_coding[0] | line_coding[1] << 8 | line_coding[2] << 16, (uint32_t)in_head);
+		if (n > 0 && (n % 60000) == 0)   /* late state survives the ramoops wrap */
+			printf("OP2 USB: %us: cfg %d alt %d desc 0x%x setup %u sf %u rx %llu tx %llu\n", n / 1000,
+			    usb_configured, ecm_alt, ecm_desc_err, ev_logged, start_fail, ecm_rx_frames,
+			    ecm_tx_frames);
 		IOSleep(1);
 	}
 }
