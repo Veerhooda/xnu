@@ -1424,13 +1424,13 @@ AppleCLCD::present(const uint8_t *rec)
 	}
 
 	uint32_t shown_id = target_id;
-	if (fClientUI && s != fSurface && op2_fb_sample_nz(s, 5000) == 0) {
+	if (fClientUI && s != fSurface && (op2_fb_sample_nz(s, 5000) == 0 || (s->height >= fHeight && op2_fb_sample_nz_bottom(s, 64) == 0))) {
 		/*
 		 * GPU-less policy (boot-arg op2fb_client_ui=1): the render
 		 * server cannot composite without a GPU, so its target stays
-		 * blank. Clients still rasterize into their own full-screen
-		 * surfaces on CPU; show the fullest one instead of a black
-		 * frame. Never triggers on a healthy (non-blank) server.
+		 * blank or half-black (status bar only). Clients still rasterize
+		 * into their own full-screen surfaces on CPU; show the fullest
+		 * one instead of a black or half-black frame.
 		 */
 		OP2Surface *best = NULL;
 		uint32_t best_nz = 100; /* minimum content threshold */

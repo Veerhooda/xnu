@@ -140,6 +140,30 @@ BUILD/obj/DEVELOPMENT_ARM64_MSM8994/kernel.development.msm8994
 
 ---
 
+## Required Boot Arguments & Command Line Options
+
+When booting XNU on the OnePlus 2 via fastboot (`fastboot boot out/xnu-boot.img`), the following boot arguments are required or recommended for stability, display fidelity, and user interactivity:
+
+| Boot Argument | Default | Critical? | Description & Rationale |
+| :--- | :--- | :--- | :--- |
+| `op2fb_hwscale=0` | `0` | **REQUIRED** | **Bypasses Qualcomm QSEED hardware scaler.** Downscaling from Retina 1242×2208 to native 1080×1920 is handled directly by XNU's fixed-point SIMD bilinear downsampler into carveout slot 0 (`0x03400000`). Disabling hardware scaling prevents Qualcomm MDSS MDP5 AXI bus underflows and SMMU faults. |
+| `op2fb_client_ui=1` | `1` | **REQUIRED** | Enables client UI fallback compositing. When the GPU render server target is blank or half-black (e.g. status bar only), XNU scans out the fullest rasterized client surface (such as SpringBoard or active apps) instead of a black frame. |
+| `metal=3` | `3` | **REQUIRED** | Enables Level 3 Metal GPU acceleration via `OP2Metal` and the Adreno 430 Mesa freedreno driver for backboardd, SpringBoard, and userland applications. |
+| `op2_autoinput=0` | `0` | **REQUIRED** | Hands-on physical touch mode: synthetic micro-events are disabled completely so that all touch events on the Synaptics panel go directly to iOS UIKit views and dock icons without interference. |
+| `op2fb_keepon=1` | `1` | **REQUIRED** | Keeps the physical display panel and MDSS backlight awake at all times, preventing screen sleep during interactive testing. |
+| `op2_deadline=7200` | `7200` | **REQUIRED** | Watchdog safety deadline timer in seconds (e.g., 7200 for 2 hours, 1800 for 30 minutes). Automatically synchronizes filesystems and performs a clean hardware reset to TWRP recovery upon expiration, preventing battery drain or hard locks. |
+| `rd=emmcroot0` | `emmcroot0` | **REQUIRED** | Directs XNU root filesystem mounting to the Qualcomm SDHCI eMMC block driver (`/dev/emmcroot0`). |
+| `emmcroot=userdata` | `userdata` | **REQUIRED** | Selects the internal eMMC `userdata` partition as the HFS+ root filesystem. |
+| `rootrw=1 emmcrw=1` | `1` | **REQUIRED** | Enables read-write access to eMMC storage and mounts the root filesystem read-write. |
+| `cs_enforcement_disable=1` | `1` | **REQUIRED** | Disables Darwin code signing enforcement, allowing custom userland utilities, injected dylibs, and shims to execute. |
+| `launchd_unsecure_cache=1` | `1` | **REQUIRED** | Allows iOS 12 launchd to load patched daemons and custom launch services without security cache rejection. |
+| `cpus=4` | `4` | **REQUIRED** | Boots all 4 Cortex-A53 cores on the power-efficient cluster via SCM mailbox bootstrap. |
+| `-v` | N/A | Optional | Enables verbose kernel console output. |
+| `keepsyms=1` | `1` | Optional | Preserves kernel symbol table in RAM for debugging backtraces. |
+| `op2_userlog=0` | `0` | Optional | Suppresses noisy userland log spam from wrapping the ramoops ring buffer. |
+
+---
+
 ## Directory Organization
 
 * `bsd/dev/op2_emmc.c` — Qualcomm SDHCI eMMC 5.0 block device driver.
