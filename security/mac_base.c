@@ -1801,6 +1801,58 @@ __mac_set_link(proc_t p, struct __mac_set_link_args *uap,
  *                !0                      Not success
  *
  */
+
+/*
+ * OP2 (2026-11-17): no Sandbox kext here, so __mac_syscall("Sandbox", ...) found no policy. Call 4 is
+ * sandbox_container_path_for_pid(): Safari's +[NSUserDefaults _sf_safariDefaults] uses it to find its own
+ * container and, when it fails, falls back to a path that yields nil defaults, so Safari configured every
+ * web view with JavaScript off. Answer it for a process asking about itself: an app's container is its HOME
+ * (set by FrontBoard at launch), read from the process's own exec strings. Anything else keeps failing.
+ */
+static int
+op2_sandbox_container_path(proc_t p, user_addr_t uarg)
+{
+	struct {
+		int64_t pid;
+		uint64_t buf;
+		uint64_t size;
+	} a;
+	int error = copyin(uarg, &a, sizeof(a));
+	if (error) {
+		return error;
+	}
+	if (a.pid != proc_pid(p) || a.buf == 0 || a.size == 0) {
+		return ESRCH;
+	}
+	u_int len = p->p_argslen;
+	if (len == 0 || len > 64 * 1024 || p->user_stack == 0) {
+		return ESRCH;
+	}
+	char *strs = kalloc(len + 1);
+	if (strs == NULL) {
+		return ENOMEM;
+	}
+	error = copyin(p->user_stack - len, strs, len);
+	strs[len] = 0;
+	const char *home = NULL;
+	if (error == 0) {
+		for (u_int i = 0; i + 5 < len; i++) {
+			if ((i == 0 || strs[i - 1] == 0) && strncmp(strs + i, "HOME=", 5) == 0) {
+				home = strs + i + 5;
+			}
+		}
+	}
+	if (home != NULL && (strncmp(home, "/private/var/mobile/Containers/", 31) == 0 ||
+	    strncmp(home, "/var/mobile/Containers/", 23) == 0)) {
+		size_t hl = strlen(home) + 1;
+		error = (hl <= a.size) ? copyout(home, (user_addr_t)a.buf, hl) : ERANGE;
+	} else if (error == 0) {
+		error = ESRCH;
+	}
+	kfree(strs, len + 1);
+	return error;
+}
+
 int
 __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 {
@@ -1816,6 +1868,10 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
 	}
 	AUDIT_ARG(value32, uap->call);
 	AUDIT_ARG(mac_string, target);
+
+	if (uap->call == 4 && strcmp(target, "Sandbox") == 0) {
+		return op2_sandbox_container_path(p, uap->arg);
+	}
 
 	error = ENOPOLICY;
 

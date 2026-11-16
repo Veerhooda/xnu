@@ -138,6 +138,9 @@ extern const char *mach_syscall_name_table[];
 extern struct proc* current_proc(void);
 extern int proc_pid(struct proc*);
 
+extern int op2_systrace_match(void);
+extern void op2_systrace_log(const char *kind, int code, long err, uint64_t a0, uint64_t a1);
+
 void
 mach_syscall(struct arm_saved_state *state)
 {
@@ -192,6 +195,13 @@ mach_syscall(struct arm_saved_state *state)
 	    args.arg1, args.arg2, args.arg3, args.arg4, 0);
 
 	retval = mach_call(&args);
+	/* traps 26..29 return port names, not errors; 0x10000004 = MACH_SEND_TIMED_OUT */
+	if (retval != KERN_SUCCESS && (call_number < 26 || call_number > 29) && call_number != 50 && call_number != 91 &&
+	    retval != 0x10000004 && retval != 0x10004003 /* MACH_RCV_TIMED_OUT */ &&
+	    retval != 0x10004005 /* MACH_RCV_INTERRUPTED */ && retval != 0x10000007 /* MACH_SEND_INTERRUPTED */ &&
+	    op2_systrace_match()) {
+		op2_systrace_log("mach", call_number, retval, args.arg1, args.arg2);
+	}
 
 	DEBUG_KPRINT_SYSCALL_MACH("mach_syscall: retval=0x%x (pid %d, tid %lld)\n", retval,
 	    proc_pid(current_proc()), thread_tid(current_thread()));

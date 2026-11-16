@@ -14,6 +14,7 @@
 #include <arm/thread.h>
 #include <arm/proc_reg.h>
 #include <pexpert/pexpert.h>
+#include <libkern/libkern.h>
 
 #include <sys/kernel.h>
 #include <sys/vm.h>
@@ -79,6 +80,41 @@ __XNU_PRIVATE_EXTERN	int             syscalls_log[SYS_MAXSYSCALL];
 #ifdef __arm__
 __attribute__((noreturn))
 #endif
+
+/*
+ * OP2 (2026-11-17): boot-arg op2_systrace=1 logs the failing BSD system calls and Mach traps of WebKit's
+ * WebContent process (Safari's page process, where JavaScript never runs), 500 lines at most. Routine
+ * outcomes (interrupted/timed-out waits) are skipped. Diagnostic only; off by default.
+ */
+static int op2_systrace_on = -1;
+static int op2_systrace_lines;
+
+int op2_systrace_match(void);
+void op2_systrace_log(const char *kind, int code, long err, uint64_t a0, uint64_t a1);
+
+int
+op2_systrace_match(void)
+{
+	if (op2_systrace_on < 0) {
+		int v = 0;
+		PE_parse_boot_argn("op2_systrace", &v, sizeof(v));
+		op2_systrace_on = v;
+	}
+	if (op2_systrace_on <= 0 || op2_systrace_lines >= 1500) {
+		return 0;
+	}
+	proc_t p = current_proc();
+	return p != NULL && strncmp(p->p_name, "com.apple.WebKit.WebContent", 27) == 0;
+}
+
+void
+op2_systrace_log(const char *kind, int code, long err, uint64_t a0, uint64_t a1)
+{
+	op2_systrace_lines++;
+	printf("OP2 SYSTRACE %d %s %d err 0x%lx args 0x%llx 0x%llx\n", proc_pid(current_proc()), kind, code, err,
+	    (unsigned long long)a0, (unsigned long long)a1);
+}
+
 void
 unix_syscall(
 	     struct arm_saved_state * state,
@@ -160,6 +196,28 @@ unix_syscall(
 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
 	error = (*(callp->sy_call)) (proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+	if (error != 0 && error != EJUSTRETURN && error != ERESTART && error != EINTR && error != ETIMEDOUT &&
+	    op2_systrace_match()) {
+		/* the path (or MAC policy name) for the calls that take one */
+		user_addr_t sp = 0;
+		if (code == 5 || code == 33 || code == 338 || code == 340 || code == 398 || code == 381) {
+			sp = (user_addr_t)uthread->uu_arg[0];
+		} else if (code == 463 || code == 466 || code == 469) {   /* openat, faccessat, fstatat64 */
+			sp = (user_addr_t)uthread->uu_arg[1];
+		}
+		char path[96];
+		size_t done = 0;
+		if (sp != 0 && copyinstr(sp, path, sizeof(path), &done) != 0) {
+			path[0] = 0;
+		}
+		if (sp != 0) {
+			path[sizeof(path) - 1] = 0;
+			op2_systrace_lines++;
+			printf("OP2 SYSTRACE %d sys %d err %d %s\n", proc_pid(proc), code, error, path);
+		} else {
+			op2_systrace_log("sys", code, error, uthread->uu_arg[0], uthread->uu_arg[1]);
+		}
+	}
 
 	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error, 
 			uthread->uu_rval[0], uthread->uu_rval[1], 
