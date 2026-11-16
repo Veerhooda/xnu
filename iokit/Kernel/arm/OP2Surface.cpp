@@ -1022,8 +1022,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		 * dimensions (1080x1920) or SpringBoard's Retina dimensions (1242x2208)
 		 * so MDP5 VIG0 hardware pipe can scan it out directly with hardware scaling.
 		 */
-		if (((s->width == 1080 && s->height == 1920) || (s->width == 1242 && s->height == 2208)) &&
-		    s->allocSize <= OP2_CARVEOUT_SLOT_SIZE) {
+		/* 2026-11-16: panel-sized surfaces only. 1242x2208 in the (uncached) carveout made the CPU downsample read
+		 * uncached memory: ~183 ms a frame, the stutter, while op2fb_hwscale=0 keeps the hardware scaler unused.
+		 * Put 1242x2208 back here only together with a working MDP scaler path. */
+		if (s->width == 1080 && s->height == 1920 && s->allocSize <= OP2_CARVEOUT_SLOT_SIZE) {
 			carveout_phys = op2_carveout_alloc_slot(s->allocSize);
 		}
 

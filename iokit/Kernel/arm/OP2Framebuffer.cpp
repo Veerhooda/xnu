@@ -262,6 +262,18 @@ public:
 	uint32_t            fCompletedSwapID;
 	bool                fSwapWaitEnabled;
 
+	/* 2026-11-17 flash fix: copy at swap time, flip+kick when the DSI
+	 * spacing allows. fEarlyCopy is set by presentPending for one present()
+	 * call; that call either copies into the back buffer and leaves the
+	 * flip pending (fFlipPending) or refuses (fEarlyRejected). */
+	bool                fEarlyCopy;
+	bool                fEarlyRejected;
+	bool                fFlipPending;
+	uint32_t            fFlipIdx;
+	uintptr_t           fFlipPixels;
+	uint64_t            fFlipPhys;
+	void flipAndKick(void);
+
 	static void presentNowFired(OSObject *owner, IOTimerEventSource *sender);
 	void presentPending(void);
 
@@ -828,8 +840,11 @@ AppleCLCD::start(IOService *provider)
 	fBufPixels[0] = fPixels;
 	fFrontBuf = 0;
 	fDoubleBuffer = false;
+	fEarlyCopy = false;
+	fEarlyRejected = false;
+	fFlipPending = false;
 	{
-		uint32_t db = 0;   /* Default 0: preserve carveout Slot 1 for userland 1242x2208 swapchain buffers */
+		uint32_t db = 1;   /* 2026-11-17: back on. Only panel-sized surfaces use the carveout now (OP2Surface), so slot 1 is free; single-buffered copies write the buffer the DSI is reading (flashes). op2fb_double=0 turns it off. */
 		PE_parse_boot_argn("op2fb_double", &db, sizeof(db));
 		uint64_t bytes = ((uint64_t)fHeight * fRowBytes + 0xfffULL) & ~0xfffULL;
 		uint64_t back = (db != 0) ? op2_carveout_alloc_slot((uint32_t)bytes) : 0;
@@ -969,7 +984,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 #define OP2_FB_MIN_KICK_TICKS 300000ULL
 
 static uint64_t op2_fb_perf_n, op2_fb_perf_sum_us, op2_fb_perf_max_us;
-static uint64_t op2_fb_perf_deferred, op2_fb_swapwait_timeouts, op2_fb_swapwait_waits;
+static uint64_t op2_fb_perf_deferred, op2_fb_perf_early, op2_fb_swapwait_timeouts, op2_fb_swapwait_waits;
 static bool op2_fb_hwscale_active = false;  /* VIG scaler currently programmed (must be cleared for copy path) */
 static uint64_t op2_fb_hwscale_count = 0;
 static void op2_fb_thumb(OP2Surface *s, uint64_t pc);
@@ -985,13 +1000,31 @@ void
 AppleCLCD::presentPending(void)
 {
 	uint64_t now = mach_absolute_time();
+	bool early = false;
 	if (op2_fb_last_kick != 0 && (now - op2_fb_last_kick) < OP2_FB_MIN_KICK_TICKS) {
 		uint64_t wait_ticks = OP2_FB_MIN_KICK_TICKS - (now - op2_fb_last_kick);
 		op2_fb_perf_deferred++;
 		if (fPresentNow != NULL) {
 			fPresentNow->setTimeoutUS((uint32_t)(wait_ticks * 10 / 192) + 50);
 		}
-		return;
+		/* Too soon to kick, but copy the frame now (into the back buffer,
+		 * which the panel is not reading) so the client can reuse its
+		 * buffer; a deferred copy read it mid-render: the flashes. */
+		if (!fDoubleBuffer) {
+			return;
+		}
+		early = true;
+	} else if (fFlipPending) {
+		IOLockLock(fLock);
+		bool dirty = fDirty;
+		IOLockUnlock(fLock);
+		if (!dirty) {
+			flipAndKick();
+			return;
+		}
+		/* A newer frame is waiting: it overwrites the back buffer and is
+		 * kicked straight away below. */
+		fFlipPending = false;
 	}
 
 	uint8_t *rec = NULL;
@@ -1011,8 +1044,25 @@ AppleCLCD::presentPending(void)
 	uint32_t swapID = 0;
 	memcpy(&swapID, rec + 0x40, 4);
 	uint64_t t0 = mach_absolute_time();
+	fEarlyCopy = early;
+	fEarlyRejected = false;
 	present(rec);
+	fEarlyCopy = false;
 	uint64_t us = ((mach_absolute_time() - t0) * 10) / 192;
+	if (early && fEarlyRejected) {
+		/* Not a back-buffer frame: put it back for the timer to present. */
+		IOLockLock(fLock);
+		if (!fDirty) {
+			memcpy(fPending, rec, OP2_FB_SWAP_REC_SIZE);
+			fDirty = true;
+		}
+		IOLockUnlock(fLock);
+		IOFreeData(rec, OP2_FB_SWAP_REC_SIZE);
+		return;
+	}
+	if (early) {
+		op2_fb_perf_early++;
+	}
 	IOFreeData(rec, OP2_FB_SWAP_REC_SIZE);
 
 	IOLockLock(fLock);
@@ -1028,9 +1078,9 @@ AppleCLCD::presentPending(void)
 		op2_fb_perf_max_us = us;
 	}
 	if ((op2_fb_perf_n % 600) == 0) {
-		IOLog("OP2 FB PERF: presents=%llu avg=%lluus max=%lluus deferred=%llu swapwait waits=%llu timeouts=%llu dbl=%d\n",
+		IOLog("OP2 FB PERF: presents=%llu avg=%lluus max=%lluus deferred=%llu early=%llu swapwait waits=%llu timeouts=%llu dbl=%d\n",
 		    op2_fb_perf_n, op2_fb_perf_sum_us / 600, op2_fb_perf_max_us,
-		    op2_fb_perf_deferred, op2_fb_swapwait_waits, op2_fb_swapwait_timeouts,
+		    op2_fb_perf_deferred, op2_fb_perf_early, op2_fb_swapwait_waits, op2_fb_swapwait_timeouts,
 		    (int)fDoubleBuffer);
 		op2_fb_perf_sum_us = 0;
 		op2_fb_perf_max_us = 0;
@@ -1190,7 +1240,7 @@ AppleCLCD::swap(const uint8_t *rec)
  * Uses exact fixed-point subpixel weights (w0 + w1 = 256) across color channels.
  * Bilinear area filtering eliminates aliasing, shimmering, and jagged edges.
  */
-static inline uint32_t
+static inline __unused uint32_t   /* kept for reference; the per-frame CPU path must not blend */
 op2_blend_pixel(uint32_t p0, uint32_t p1, uint32_t w0, uint32_t w1)
 {
 	uint32_t rb0 = p0 & 0x00FF00FFu;
@@ -1539,10 +1589,27 @@ AppleCLCD::present(const uint8_t *rec)
 	}
 	op2_fb_last_direct_phys = direct_phys;
 
-	if (direct_phys >= OP2_CARVEOUT_BASE &&
+	bool directOK = direct_phys >= OP2_CARVEOUT_BASE &&
 	    (direct_phys + s->offset + (uint64_t)s->bytesPerRow * s->height) <= (OP2_CARVEOUT_BASE + OP2_CARVEOUT_SIZE) &&
 	    segLen >= (uint64_t)s->bytesPerRow * s->height &&
-	    s->width == fWidth && s->height == fHeight && fActivePipe != NULL) {
+	    s->width == fWidth && s->height == fHeight && fActivePipe != NULL;
+	if (fEarlyCopy) {
+		/* Early copy is only safe into the back buffer: full frames with
+		 * double buffering, never direct scanout (the panel would read the
+		 * client's buffer) or partial updates (they write the front buffer).
+		 * The hardware scaler is skipped here; such frames take the CPU copy. */
+		bool ff = (s->width == 1242 && s->height == 2208) ||
+		    (s->width >= fWidth && s->height >= fHeight);
+		if (directOK || !fDoubleBuffer || !ff) {
+			fEarlyRejected = true;
+			if (s != fSurface) {
+				s->release();
+			}
+			return;
+		}
+	}
+
+	if (directOK) {
 		/*
 		 * Phase 8 ZERO-COPY HARDWARE DIRECT SCANOUT:
 		 * Surface is physically contiguous in hardware DMA memory.
@@ -1562,7 +1629,7 @@ AppleCLCD::present(const uint8_t *rec)
 				    shown_id, direct_phys, s->width, s->height, s->bytesPerRow, sDirectScanoutLogged);
 			}
 		}
-	} else if (op2_fb_try_hwscale(this, s, direct_phys, segLen)) {
+	} else if (!fEarlyCopy && op2_fb_try_hwscale(this, s, direct_phys, segLen)) {
 		/* VIG0 scales the surface straight to the panel: no CPU copy,
 		 * no back-buffer flip. Shared tail below releases, barriers, kicks. */
 	} else {
@@ -1604,36 +1671,44 @@ AppleCLCD::present(const uint8_t *rec)
 						uint32_t *dst_row = (uint32_t *)(dstPixels + (uint64_t)y * fRowBytes);
 
 						/*
-						 * High-Fidelity Fixed-Point Bilinear Subpixel Downsampler (1242 -> 1080):
+						 * High-Speed 20-pixel Block Downsampler (1242 -> 1080):
 						 * 1080 = 54 blocks of 20 pixels; 1242 = 54 blocks of 23 pixels.
-						 * Blends all adjacent subpixels using exact 8-bit integer weights (w0 + w1 = 256).
-						 * Dual-channel 16-bit packed SIMD arithmetic preserves all subpixel font stems,
-						 * thin UI outlines, and eliminates aliasing and dropped strokes completely.
+						 * Block pattern: 7 contiguous pixels, skip 1, 7 contiguous pixels, skip 1, 6 contiguous pixels, skip 2.
+						 * Aligned 64-bit pair loads/stores with zero lookup table overhead.
+						 * (2026-11-16: restored. A per-pixel bilinear blend replaced it on 2026-11-15 and took ~335 ms a
+						 * frame instead of ~6 ms -- the "everything is slow" of that week. Better quality belongs in
+						 * the MDP scaler (op2fb_hwscale), not in a CPU loop.)
 						 */
 						for (int32_t b = 0; b < 54; b++) {
 							const uint32_t *sp = src_row + b * 23;
 							uint32_t *dp = dst_row + b * 20;
 
-							dp[0]  = sp[0];
-							dp[1]  = op2_blend_pixel(sp[1],  sp[2],  218, 38);
-							dp[2]  = op2_blend_pixel(sp[2],  sp[3],  180, 76);
-							dp[3]  = op2_blend_pixel(sp[3],  sp[4],  141, 115);
-							dp[4]  = op2_blend_pixel(sp[4],  sp[5],  103, 153);
-							dp[5]  = op2_blend_pixel(sp[5],  sp[6],  64,  192);
-							dp[6]  = op2_blend_pixel(sp[6],  sp[7],  26,  230);
-							dp[7]  = op2_blend_pixel(sp[8],  sp[9],  244, 12);
-							dp[8]  = op2_blend_pixel(sp[9],  sp[10], 205, 51);
-							dp[9]  = op2_blend_pixel(sp[10], sp[11], 167, 89);
-							dp[10] = op2_blend_pixel(sp[11], sp[12], 128, 128);
-							dp[11] = op2_blend_pixel(sp[12], sp[13], 90,  166);
-							dp[12] = op2_blend_pixel(sp[13], sp[14], 52,  204);
-							dp[13] = op2_blend_pixel(sp[14], sp[15], 13,  243);
-							dp[14] = op2_blend_pixel(sp[16], sp[17], 231, 25);
-							dp[15] = op2_blend_pixel(sp[17], sp[18], 192, 64);
-							dp[16] = op2_blend_pixel(sp[18], sp[19], 154, 102);
-							dp[17] = op2_blend_pixel(sp[19], sp[20], 116, 140);
-							dp[18] = op2_blend_pixel(sp[20], sp[21], 77,  179);
-							dp[19] = op2_blend_pixel(sp[21], sp[22], 39,  217);
+							const uint64_t *sp64 = (const uint64_t *)(uintptr_t)sp;
+							uint64_t *dp64 = (uint64_t *)(uintptr_t)dp;
+
+							/* Pixels 0..5 (3x 64-bit) + pixel 6 */
+							dp64[0] = sp64[0];
+							dp64[1] = sp64[1];
+							dp64[2] = sp64[2];
+							dp[6]   = sp[6];
+
+							/* Pixel 7 (skip sp[7]) */
+							dp[7]   = sp[8];
+
+							/* Pixels 8..13 (3x 64-bit) from sp[9..14] */
+							const uint64_t *sp_mid64 = (const uint64_t *)(uintptr_t)(sp + 9);
+							uint64_t *dp_mid64 = (uint64_t *)(uintptr_t)(dp + 8);
+							dp_mid64[0] = sp_mid64[0];
+							dp_mid64[1] = sp_mid64[1];
+							dp_mid64[2] = sp_mid64[2];
+
+							/* Pixels 14..19 (3x 64-bit) from sp[16..21] (skip sp[15]) */
+							const uint64_t *sp_end64 = (const uint64_t *)(uintptr_t)(sp + 16);
+							uint64_t *dp_end64 = (uint64_t *)(uintptr_t)(dp + 14);
+							dp_end64[0] = sp_end64[0];
+							dp_end64[1] = sp_end64[1];
+							dp_end64[2] = sp_end64[2];
+							/* sp[22] is skipped */
 						}
 					}
 					uint64_t dt = mach_absolute_time() - t0;
@@ -1661,9 +1736,15 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 
 		/* Flip: make the freshly written buffer the scanout source. The
-		 * FLUSH in op2_fb_kick_panel latches SRC0 before START. */
+		 * FLUSH in op2_fb_kick_panel latches SRC0 before START. In early-copy
+		 * mode the flip and kick wait for flipAndKick(). */
 		__asm__ volatile("dsb sy" ::: "memory");
-		if (fActivePipe != NULL) {
+		if (fEarlyCopy) {
+			fFlipPending = true;
+			fFlipIdx = dstIdx;
+			fFlipPixels = dstPixels;
+			fFlipPhys = dstPhys;
+		} else if (fActivePipe != NULL) {
 			fActivePipe[0x00 / 4] = (fHeight << 16) | fWidth;
 			fActivePipe[0x04 / 4] = (fHeight << 16) | fWidth;
 			fActivePipe[0x08 / 4] = 0;
@@ -1677,9 +1758,11 @@ AppleCLCD::present(const uint8_t *rec)
 				fActivePipe[0x204 / 4] = 0;
 			}
 		}
-		op2_fb_direct_cur = 0;
-		fFrontBuf = dstIdx;
-		fPixels = dstPixels;
+		if (!fEarlyCopy) {
+			op2_fb_direct_cur = 0;
+			fFrontBuf = dstIdx;
+			fPixels = dstPixels;
+		}
 	}
 
 	if ((pc % 240) == 0)
@@ -1693,6 +1776,39 @@ AppleCLCD::present(const uint8_t *rec)
 	__asm__ volatile("dsb sy" ::: "memory");
 
 	/* Kick command-mode panel to send newly swapped frame to display GRAM */
+	if (!fEarlyCopy) {
+		op2_fb_kick_panel(fMdpCtl);
+	}
+}
+
+/* Workloop context. Finish an early-copied frame: point the pipe at the
+ * back buffer, flip, kick. Caller guarantees the kick spacing has elapsed. */
+void
+AppleCLCD::flipAndKick(void)
+{
+	if (!fFlipPending) {
+		return;
+	}
+	fFlipPending = false;
+	__asm__ volatile("dsb sy" ::: "memory");
+	if (fActivePipe != NULL) {
+		fActivePipe[0x00 / 4] = (fHeight << 16) | fWidth;
+		fActivePipe[0x04 / 4] = (fHeight << 16) | fWidth;
+		fActivePipe[0x08 / 4] = 0;
+		fActivePipe[0x0c / 4] = (fHeight << 16) | fWidth;
+		fActivePipe[0x10 / 4] = 0;
+		fActivePipe[0x14 / 4] = (uint32_t)fFlipPhys;
+		fActivePipe[0x24 / 4] = fRowBytes;
+		fActivePipe[0x30 / 4] = 0x000236ffu;
+		fActivePipe[0x34 / 4] = 0x03020001u;
+		if (fPipeHasScaler) {
+			fActivePipe[0x204 / 4] = 0;
+		}
+	}
+	op2_fb_direct_cur = 0;
+	fFrontBuf = fFlipIdx;
+	fPixels = fFlipPixels;
+	__asm__ volatile("dsb sy" ::: "memory");
 	op2_fb_kick_panel(fMdpCtl);
 }
 
