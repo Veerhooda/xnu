@@ -74,6 +74,23 @@ int proc_check_footprint_priv(void);
  * Check a credential for privilege.  Lots of good reasons to deny privilege;
  * only a few to grant it.
  */
+extern boolean_t IOTaskHasEntitlement(task_t task, const char *entitlement);
+extern task_t current_task(void);
+extern char *proc_name_address(void *p);
+
+static const char *
+op2_priv_entitlement(int priv)
+{
+	switch (priv) {
+	case PRIV_NET_PRIVILEGED_SOCKET_DELEGATE:     return "com.apple.private.network.socket-delegate";
+	case PRIV_NET_PRIVILEGED_NETWORK_STATISTICS:  return "com.apple.private.network.statistics";
+	case PRIV_NET_PRIVILEGED_NECP_POLICIES:       return "com.apple.private.necp.policies";
+	case PRIV_NET_PRIVILEGED_NECP_MATCH:          return "com.apple.private.necp.match";
+	case PRIV_NET_PRIVILEGED_MULTIPATH:           return "com.apple.developer.networking.multipath";
+	default:                                      return NULL;
+	}
+}
+
 int
 priv_check_cred(kauth_cred_t cred, int priv, int flags)
 {
@@ -117,6 +134,24 @@ priv_check_cred(kauth_cred_t cred, int priv, int flags)
 		goto out;
 	}
 #endif
+
+	/*
+	 * OP2: no Sandbox kext here, and on iOS it is the policy that grants these privileges to
+	 * processes holding the matching entitlement. Without it, e.g. WebKit's network process
+	 * (com.apple.private.network.socket-delegate) could not delegate sockets or DNS for Safari:
+	 * "server cannot be found". Grant from the caller's own entitlements, nothing else.
+	 */
+	if (cred == kauth_cred_get()) {
+		const char *ent = op2_priv_entitlement(priv);
+		if (ent != NULL && IOTaskHasEntitlement(current_task(), ent)) {
+			static int logged;
+			if (logged++ < 20) {
+				printf("OP2 PRIV: %d granted to %s by %s\n", priv, proc_name_address(current_proc()), ent);
+			}
+			error = 0;
+			goto out;
+		}
+	}
 
 	/*
 	 * The default is deny, so if no policies have granted it, reject

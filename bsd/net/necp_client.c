@@ -5460,6 +5460,111 @@ done:
 	return error;
 }
 
+/*
+ * 2026-11-17 OP2: NECP_CLIENT_ACTION_ADD_FLOW / REMOVE_FLOW. Apple ships these only in its private
+ * (Skywalk) kernel; open-source 4903 rejected them with EINVAL, so every Network.framework connection
+ * (Safari, NSURLSession) failed with "failed to request add flow" -> "offline" (-1009) even though plain
+ * sockets worked. Socket flows need only a flow registration: the socket then names it through
+ * SO_NECP_CLIENTUUID (necp_client_register_socket_flow). Nexus flows and per-flow stats buffers are not
+ * supported (there is no Skywalk here): the stats requests are accepted and left untouched.
+ */
+static int
+necp_client_add_flow(struct necp_fd_data *fd_data, struct necp_client_action_args *uap, int *retval)
+{
+	int error = 0;
+	uuid_t client_id = {};
+	struct necp_client_add_flow_default add_default = {};
+	struct necp_client_add_flow *add_request = (struct necp_client_add_flow *)&add_default;
+	u_int8_t *allocated = NULL;
+	size_t size = uap->buffer_size;
+
+	if (uap->client_id == 0 || uap->client_id_len != sizeof(uuid_t) ||
+	    uap->buffer == 0 || size < sizeof(struct necp_client_add_flow) ||
+	    size > sizeof(struct necp_client_add_flow) + 64 * sizeof(struct necp_client_flow_stats)) {
+		error = EINVAL;
+		goto done;
+	}
+	error = copyin(uap->client_id, client_id, sizeof(uuid_t));
+	if (error) {
+		goto done;
+	}
+	if (size > sizeof(add_default)) {
+		MALLOC(allocated, u_int8_t *, size, M_NECP, M_WAITOK | M_ZERO);
+		if (allocated == NULL) {
+			error = ENOMEM;
+			goto done;
+		}
+		add_request = (struct necp_client_add_flow *)allocated;
+	}
+	error = copyin(uap->buffer, add_request, size);
+	if (error) {
+		goto done;
+	}
+
+	NECP_FD_LOCK(fd_data);
+	struct necp_client *client = necp_client_fd_find_client_unlocked(fd_data, client_id);
+	if (client == NULL || necp_client_id_is_flow(client_id)) {
+		error = ENOENT;
+	} else {
+		NECP_CLIENT_LOCK(client);
+		struct necp_client_flow_registration *reg = necp_client_create_flow_registration(fd_data, client);
+		if (reg == NULL) {
+			error = ENOMEM;
+		} else {
+			reg->flags = add_request->flags;
+			uuid_copy(add_request->registration_id, reg->registration_id);
+		}
+		NECP_CLIENT_UNLOCK(client);
+	}
+	NECP_FD_UNLOCK(fd_data);
+
+	if (error == 0) {
+		error = copyout(add_request, uap->buffer, size);   /* hands back registration_id */
+	}
+done:
+	if (allocated != NULL) {
+		FREE(allocated, M_NECP);
+	}
+	*retval = error;
+	return error;
+}
+
+static int
+necp_client_remove_flow(struct necp_fd_data *fd_data, struct necp_client_action_args *uap, int *retval)
+{
+	int error = 0;
+	struct necp_client_flow_registration find = {};
+
+	if (uap->client_id == 0 || uap->client_id_len != sizeof(uuid_t)) {
+		error = EINVAL;
+		goto done;
+	}
+	error = copyin(uap->client_id, find.registration_id, sizeof(uuid_t));
+	if (error) {
+		goto done;
+	}
+
+	NECP_FD_LOCK(fd_data);
+	pid_t pid = fd_data->proc_pid;
+	struct necp_client_flow_registration *reg = RB_FIND(_necp_fd_flow_tree, &fd_data->flows, &find);
+	if (reg == NULL || reg->client == NULL) {
+		error = ENOENT;
+	} else {
+		struct necp_client *client = reg->client;
+		NECP_FLOW_TREE_LOCK_EXCLUSIVE();
+		RB_REMOVE(_necp_client_flow_global_tree, &necp_client_flow_global_tree, reg);
+		NECP_FLOW_TREE_UNLOCK();
+		RB_REMOVE(_necp_fd_flow_tree, &fd_data->flows, reg);
+		NECP_CLIENT_LOCK(client);
+		necp_destroy_client_flow_registration(client, reg, pid, false);
+		NECP_CLIENT_UNLOCK(client);
+	}
+	NECP_FD_UNLOCK(fd_data);
+done:
+	*retval = error;
+	return error;
+}
+
 int
 necp_client_action(struct proc *p, struct necp_client_action_args *uap, int *retval)
 {
@@ -5519,6 +5624,14 @@ necp_client_action(struct proc *p, struct necp_client_action_args *uap, int *ret
 	}
 	case NECP_CLIENT_ACTION_COPY_CLIENT_UPDATE: {
 		return_value = necp_client_copy_client_update(fd_data, uap, retval);
+		break;
+	}
+	case NECP_CLIENT_ACTION_ADD_FLOW: {
+		return_value = necp_client_add_flow(fd_data, uap, retval);
+		break;
+	}
+	case NECP_CLIENT_ACTION_REMOVE_FLOW: {
+		return_value = necp_client_remove_flow(fd_data, uap, retval);
 		break;
 	}
 	default: {

@@ -8,6 +8,9 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOKitKeys.h>
+#include <libkern/crypto/sha1.h>
+#include <uuid/uuid.h>
 #include "OP2InterruptController.h"
 extern "C" {
 #include <prng/random.h>
@@ -69,6 +72,42 @@ OP2PlatformExpert::setGMTTimeOfDay(long secs)
 	}
 }
 
+/*
+ * IOPlatformUUID. Stock XNU publishes it from registerNVRAMController; we have no NVRAM
+ * controller, so it never appeared and gethostuuid() (no timeout) blocked forever. configd's
+ * IPConfiguration plugin calls it while loading, which stalled every network plugin after it
+ * (no IPMonitor, no KernelEventMonitor, no DNS, no routes). Name-based (v5) UUID from the ADT
+ * serial-number, so it is stable across boots.
+ */
+static void
+op2_publish_platform_uuid(IOService *provider)
+{
+	const char *serial = "OP2IOS120400";
+	OSData *sn = OSDynamicCast(OSData, provider->getProperty("serial-number"));
+	if (sn != NULL && sn->getLength() > 1) {
+		serial = (const char *)sn->getBytesNoCopy();
+	}
+	static const uint8_t space[16] = { 0x4f, 0x50, 0x32, 0x2d, 0x69, 0x4f, 0x53, 0x2d,
+	                                   0x75, 0x75, 0x69, 0x64, 0x2d, 0x76, 0x30, 0x31 };
+	SHA1_CTX ctx;
+	uint8_t digest[SHA_DIGEST_LENGTH];
+	SHA1Init(&ctx);
+	SHA1Update(&ctx, space, sizeof(space));
+	SHA1Update(&ctx, serial, strnlen(serial, 64));
+	SHA1Final(digest, &ctx);
+	digest[6] = (digest[6] & 0x0F) | 0x50;
+	digest[8] = (digest[8] & 0x3F) | 0x80;
+	uuid_string_t str;
+	uuid_unparse_upper(digest, str);
+	OSString *s = OSString::withCString(str);
+	if (s != NULL) {
+		IOService::getPlatform()->getProvider()->setProperty(kIOPlatformUUIDKey, s);
+		IOService::getPlatform()->publishResource(kIOPlatformUUIDKey, s);
+		s->release();
+	}
+	IOLog("OP2: IOPlatformUUID %s (serial %s)\n", str, serial);
+}
+
 bool
 OP2PlatformExpert::start(IOService *provider)
 {
@@ -96,6 +135,7 @@ OP2PlatformExpert::start(IOService *provider)
 
 	PE_halt_restart = op2_pe_halt_restart;
 	publishResource("IORTC", kOSBooleanTrue);
+	op2_publish_platform_uuid(provider);
 	registerService();
 	IOLog("OP2: platform expert registered successfully\n");
 	return true;

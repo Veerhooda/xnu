@@ -16,3 +16,4 @@ iokit/Kernel/arm/OP2Battery.cpp				optional iokitcpp
 iokit/Kernel/arm/OP2I2C.cpp					optional iokitcpp
 iokit/Kernel/arm/OP2GPU.cpp					optional iokitcpp
 
+iokit/Kernel/arm/OP2Scaler.cpp					optional iokitcpp
