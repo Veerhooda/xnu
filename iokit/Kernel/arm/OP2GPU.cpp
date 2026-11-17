@@ -1905,6 +1905,20 @@ OP2GPU::newUserClient(task_t owningTask, void *securityID,
 {
 	if (!handler) return kIOReturnBadArgument;
 
+	/* 2026-11-17: mediaserverd's video stack (HDR processor, CoreVideo) treats our accelerator as Apple's
+	 * and crashed at startup (bad_alloc; 64 KB buffers written past their end). Refuse it, so it takes its
+	 * CPU paths, like OP2Metal does for its Metal device. */
+	{
+		char name[64] = "";
+		proc_name(proc_selfpid(), name, sizeof(name));
+		if (strcmp(name, "mediaserverd") == 0) {
+			static int sLogged;
+			if (sLogged++ < 3)
+				IOLog("OP2 GPU: user client (type 0x%x) refused for mediaserverd\n", type);
+			return kIOReturnUnsupported;
+		}
+	}
+
 	OP2GPUUserClient *client = OSTypeAlloc(OP2GPUUserClient);
 	if (!client) {
 		return kIOReturnNoMemory;

@@ -777,11 +777,15 @@ op2_surface_fill_result(OP2Surface *s, OP2SurfaceRef *ref, uint8_t *out)
 	for (uint32_t i = 0; i < s->planeCount; i++) {
 		uint8_t *p = out + 0x50 + i * 0x6c;
 		const struct op2_surface_plane *pl = &s->planes[i];
+		/* iOS 12 IOSurface.framework (IOSurfaceClientGetBytesPerRowOfPlane / GetOffsetOfPlane, plane record at
+		 * client +0xa8 + i*0x6c, = reply +0x50): width 0x00, height 0x04, offset 0x0c, bytesPerRow 0x10,
+		 * size 0x14. Until 2026-11-17 bytesPerRow sat at 0x08 and size at 0x10, so every multi-plane (YUV)
+		 * surface reported its plane size as its row stride (mediaserverd's HDR processor overflowed). */
 		put32(p, 0x00, pl->width);
 		put32(p, 0x04, pl->height);
-		put32(p, 0x08, pl->bytesPerRow);
 		put32(p, 0x0c, pl->offset);
-		put32(p, 0x10, pl->size);
+		put32(p, 0x10, pl->bytesPerRow);
+		put32(p, 0x14, pl->size);
 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
 		p[0x1a] = pl->elementWidth;
 		p[0x1b] = pl->elementHeight;
