@@ -34,6 +34,7 @@ public:
 	uint16_t bytesPerElement;
 	uint8_t  elementWidth, elementHeight;
 	uint32_t cacheMode, planeCount, parentID;
+	volatile SInt32 useCount;                /* IOSurfaceIncrement/DecrementUseCount (sel 14/15) */
 	struct op2_surface_plane planes[OP2_SURFACE_MAX_PLANES];
 
 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */

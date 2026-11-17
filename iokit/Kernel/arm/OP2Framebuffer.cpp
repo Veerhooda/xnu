@@ -148,6 +148,7 @@ enum {
 	kOP2FBNotifications           = 72,
 	kOP2FBChangeFrameInfo         = 73,
 	kOP2FBSupportedFrameInfo      = 74,
+	kOP2FBDebugCopyPanel          = 96,   /* OP2 debug: the panel's front buffer (what is on screen) -> caller */
 };
 
 #define OP2_FB_SWAP_REC_SIZE          0x46c
@@ -868,7 +869,19 @@ AppleCLCD::start(IOService *provider)
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	/* iOS 12 reads this as a dictionary (VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService:
+	 * DisplayPipePlaneBaseAlignment -> PlaneBaseAlignmentLinear). As a bare number, mediaserverd threw
+	 * "-[__NSCFNumber objectForKey:]" and died whenever a video started (2026-11-17). */
+	{
+		OSDictionary *align = OSDictionary::withCapacity(1);
+		OSNumber *linear = OSNumber::withNumber(64ULL, 32);
+		if (align != NULL && linear != NULL) {
+			align->setObject("PlaneBaseAlignmentLinear", linear);
+			setProperty("DisplayPipePlaneBaseAlignment", align);
+		}
+		OSSafeReleaseNULL(linear);
+		OSSafeReleaseNULL(align);
+	}
 	registerService();
 	IOLog("OP2 FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, flush every %u vsyncs, client-ui %s\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fFlushTicks, fClientUI ? "on" : "off");
@@ -2012,6 +2025,28 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	}
 
 	switch (selector) {
+	case kOP2FBDebugCopyPanel: {
+		/* screenshots without the render server: copy the scanout buffer (BGRA, fWidth x fHeight, fRowBytes) */
+		uint64_t len = (uint64_t)fFB->fHeight * fFB->fRowBytes;
+		if (fFB->fPixels == 0) {
+			ret = kIOReturnNotReady;
+		} else if (args->structureOutputDescriptor != NULL) {
+			IOMemoryDescriptor *md = args->structureOutputDescriptor;
+			if (md->getLength() < len) {
+				ret = kIOReturnNoSpace;
+			} else if ((ret = md->prepare()) == kIOReturnSuccess) {
+				md->writeBytes(0, (const void *)fFB->fPixels, len);
+				md->complete();
+				args->structureOutputDescriptorSize = (uint32_t)len;
+			}
+		} else {
+			ret = kIOReturnNoSpace;
+		}
+		out[0] = fFB->fWidth;
+		out[1] = fFB->fRowBytes;
+		outCount = 2;
+		break;
+	}
 	case kOP2FBGetLayerDefaultSurface:
 		out[0] = op2_surface_port_in_task(fFB->fSurface, fTask);
 		outCount = 1;

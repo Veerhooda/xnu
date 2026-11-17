@@ -93,6 +93,14 @@ enum {
 	kOP2SurfaceLimits             = 13,
 	kOP2SurfaceLookupFromPort     = 33,
 	kOP2SurfaceCreatePort         = 34,
+	/* iOS 12 IOSurface.framework selectors (IOSurfaceClient* in the shared cache), 2026-11-17 */
+	kOP2SurfaceSetYCbCrMatrix     = 5,
+	kOP2SurfaceRemoveValue        = 11,
+	kOP2SurfaceIncrementUseCount  = 14,
+	kOP2SurfaceDecrementUseCount  = 15,
+	kOP2SurfaceSetPurgeable       = 20,
+	kOP2SurfaceIsTiled            = 22,
+	kOP2SurfaceSetBulkAttachments = 26,
 };
 
 enum {
@@ -1114,6 +1122,18 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 	return ret;
 }
 
+/* success with every output zeroed (scalars and structure) */
+static void
+op2_zero_outputs(IOExternalMethodArguments *args)
+{
+	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+		args->scalarOutput[i] = 0;
+	}
+	if (args->structureOutput != NULL && args->structureOutputSize > 0) {
+		bzero(args->structureOutput, args->structureOutputSize);
+	}
+}
+
 IOReturn
 IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
@@ -1269,6 +1289,31 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return setValues(args);
 	case kOP2SurfaceCopyValues:
 		return copyValues(args);
+	case kOP2SurfaceIncrementUseCount:
+	case kOP2SurfaceDecrementUseCount: {
+		/* Remote VideoToolbox marks each decoded frame's surface in use before handing it to the client
+		 * (mediaserverd -> app); unsupported here, the frames never arrived (2026-11-17). */
+		OP2Surface *s = op2_surface_copy((uint32_t)arg0);
+		if (s == NULL) {
+			return kIOReturnNotFound;
+		}
+		if (selector == kOP2SurfaceIncrementUseCount) {
+			OSIncrementAtomic(&s->useCount);
+		} else if (s->useCount > 0) {
+			OSDecrementAtomic(&s->useCount);
+		}
+		s->release();
+		op2_zero_outputs(args);
+		return kIOReturnSuccess;
+	}
+	case kOP2SurfaceSetYCbCrMatrix:     /* accepted, not used: no scaler/converter reads it */
+	case kOP2SurfaceRemoveValue:        /* values are kept until the surface goes away */
+	case kOP2SurfaceSetPurgeable:       /* never purged: old state out = non-volatile (0) */
+	case kOP2SurfaceIsTiled:            /* linear surfaces only: out = 0 */
+	case kOP2SurfaceSetBulkAttachments:
+		op2_zero_outputs(args);
+		op2_surf_log_once("sel", selector);
+		return kIOReturnSuccess;
 	default:
 		/*
 		 * If userland expects a structure output (e.g. an unhandled lookup

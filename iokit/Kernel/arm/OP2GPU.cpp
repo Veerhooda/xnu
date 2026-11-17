@@ -1641,6 +1641,18 @@ op2_pool_alloc(uint64_t len, uint64_t *off)
 			break;
 		}
 	}
+	if (!ok) {   /* why: exhausted or fragmented (2026-11-17, heavy pages turned the screen white) */
+		uint64_t freeBytes = 0, largest = 0;
+		for (unsigned i = 0; i < gPoolNFree; i++) {
+			freeBytes += gPoolFree[i].len;
+			if (gPoolFree[i].len > largest)
+				largest = gPoolFree[i].len;
+		}
+		static unsigned sLogged;
+		if (sLogged++ < 40)
+			IOLog("OP2 GPU POOL: %llu KB wanted: %llu KB free of %llu MB, largest %llu KB, %u extents\n", len >> 10,
+			    freeBytes >> 10, gPoolBytes >> 20, largest >> 10, gPoolNFree);
+	}
 	IOLockUnlock(gPoolLock);
 	return ok;
 }
